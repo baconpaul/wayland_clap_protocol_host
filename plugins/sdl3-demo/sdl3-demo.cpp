@@ -8,7 +8,9 @@
 //   it the embedded role with the host's token.
 // - A host timer pumps SDL's events and draws a frame.
 //
-// SDL's video subsystem is global, so only one instance at a time can show its GUI.
+// SDL's video subsystem is global to the process, so all the instances share it, and with it one
+// connection to the host's compositor: the token tells the compositor where each surface goes.
+// SDL's event queue is global too, so the events go to the instance whose window they are for.
 //
 // The audio is a quiet 220 Hz sine.
 
@@ -54,8 +56,18 @@ namespace {
       .features = kFeatures,
    };
 
-   // Whether an instance has initialized SDL's video subsystem
-   bool gIsSdlInUse = false;
+   class Plugin;
+
+   // What the instances share: SDL's video subsystem, on one connection to the host's compositor
+   struct SharedVideo {
+      int users = 0;
+      // Of the host which gave us the connection: another host could run another compositor
+      int(CLAP_ABI *openConnection)(const clap_host *) = nullptr;
+      wl_display *display = nullptr;
+      wl_registry *registry = nullptr;
+      clap_surface_embedding_v1 *embedding = nullptr;
+      std::vector<Plugin *> plugins; // with a window
+   } gVideo;
 
    struct Ripple {
       float x, y;
@@ -142,20 +154,23 @@ namespace {
                 canEmbed();
       }
 
-      bool guiCreate(const char *api, bool isFloating) {
-         if (!isApiSupported(api, isFloating) || _window)
-            return false;
-         if (gIsSdlInUse) {
-            log(CLAP_LOG_ERROR, "SDL is already used by another instance");
-            return false;
+      // The first instance connects and initializes SDL, the others use what it set up
+      bool acquireVideo() {
+         if (gVideo.users > 0) {
+            if (gVideo.openConnection != _hostCompositor->open_connection) {
+               log(CLAP_LOG_ERROR, "SDL is already used with another host's compositor");
+               return false;
+            }
+            ++gVideo.users;
+            return true;
          }
 
          // wl_display_connect_to_fd() takes the fd, even on failure
          const int fd = _hostCompositor->open_connection(_host);
          if (fd < 0)
             return false;
-         _display = wl_display_connect_to_fd(fd);
-         if (!_display) {
+         gVideo.display = wl_display_connect_to_fd(fd);
+         if (!gVideo.display) {
             log(CLAP_LOG_ERROR, "can't connect to the host's compositor");
             return false;
          }
@@ -163,18 +178,17 @@ namespace {
          // Our own registry for clap_surface_embedding_v1, SDL makes its own for everything else
          static const wl_registry_listener registryListener = {
             .global =
-               [](void *data, wl_registry *registry, uint32_t name, const char *interface,
+               [](void *, wl_registry *registry, uint32_t name, const char *interface,
                   uint32_t version) {
-                  auto &plugin = *static_cast<Plugin *>(data);
                   if (!strcmp(interface, clap_surface_embedding_v1_interface.name))
-                     plugin._embedding = static_cast<clap_surface_embedding_v1 *>(
+                     gVideo.embedding = static_cast<clap_surface_embedding_v1 *>(
                         wl_registry_bind(registry, name, &clap_surface_embedding_v1_interface, 1));
                },
             .global_remove = [](void *, wl_registry *, uint32_t) {},
          };
-         _registry = wl_display_get_registry(_display);
-         wl_registry_add_listener(_registry, &registryListener, this);
-         if (wl_display_roundtrip(_display) < 0 || !_embedding) {
+         gVideo.registry = wl_display_get_registry(gVideo.display);
+         wl_registry_add_listener(gVideo.registry, &registryListener, nullptr);
+         if (wl_display_roundtrip(gVideo.display) < 0 || !gVideo.embedding) {
             log(CLAP_LOG_ERROR, "the host's compositor has no clap_surface_embedding_v1");
             destroyConnection();
             return false;
@@ -184,7 +198,7 @@ namespace {
          // The host owns the process
          SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
          SDL_SetPointerProperty(SDL_GetGlobalProperties(),
-                                SDL_PROP_GLOBAL_VIDEO_WAYLAND_WL_DISPLAY_POINTER, _display);
+                                SDL_PROP_GLOBAL_VIDEO_WAYLAND_WL_DISPLAY_POINTER, gVideo.display);
          if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) {
             log(CLAP_LOG_ERROR, "SDL_InitSubSystem: %s", SDL_GetError());
             SDL_SetPointerProperty(SDL_GetGlobalProperties(),
@@ -192,7 +206,42 @@ namespace {
             destroyConnection();
             return false;
          }
-         gIsSdlInUse = true;
+         gVideo.openConnection = _hostCompositor->open_connection;
+         gVideo.users = 1;
+         return true;
+      }
+
+      // The last instance shuts SDL down and disconnects
+      static void releaseVideo() {
+         if (--gVideo.users > 0)
+            return;
+         // SDL doesn't disconnect a display it was given
+         SDL_QuitSubSystem(SDL_INIT_VIDEO);
+         SDL_SetPointerProperty(SDL_GetGlobalProperties(),
+                                SDL_PROP_GLOBAL_VIDEO_WAYLAND_WL_DISPLAY_POINTER, nullptr);
+         destroyConnection();
+         gVideo.openConnection = nullptr;
+      }
+
+      static void destroyConnection() {
+         if (gVideo.embedding) {
+            clap_surface_embedding_v1_destroy(gVideo.embedding);
+            gVideo.embedding = nullptr;
+         }
+         if (gVideo.registry) {
+            wl_registry_destroy(gVideo.registry);
+            gVideo.registry = nullptr;
+         }
+         if (gVideo.display) {
+            wl_display_disconnect(gVideo.display);
+            gVideo.display = nullptr;
+         }
+      }
+
+      bool guiCreate(const char *api, bool isFloating) {
+         if (!isApiSupported(api, isFloating) || _window || !acquireVideo())
+            return false;
+         _hasVideo = true;
 
          const SDL_PropertiesID props = SDL_CreateProperties();
          SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, kDescriptor.name);
@@ -212,6 +261,7 @@ namespace {
             guiDestroy();
             return false;
          }
+         gVideo.plugins.push_back(this);
 
          _renderer = SDL_CreateRenderer(_window, nullptr);
          if (!_renderer) {
@@ -251,35 +301,17 @@ namespace {
          if (_window) {
             SDL_DestroyWindow(_window);
             _window = nullptr;
+            std::erase(gVideo.plugins, this);
          }
-         if (gIsSdlInUse && _display) {
-            // SDL doesn't disconnect a display it was given
-            SDL_QuitSubSystem(SDL_INIT_VIDEO);
-            SDL_SetPointerProperty(SDL_GetGlobalProperties(),
-                                   SDL_PROP_GLOBAL_VIDEO_WAYLAND_WL_DISPLAY_POINTER, nullptr);
-            gIsSdlInUse = false;
+         if (_hasVideo) {
+            releaseVideo();
+            _hasVideo = false;
          }
-         destroyConnection();
          _ripples.clear();
       }
 
-      void destroyConnection() {
-         if (_embedding) {
-            clap_surface_embedding_v1_destroy(_embedding);
-            _embedding = nullptr;
-         }
-         if (_registry) {
-            wl_registry_destroy(_registry);
-            _registry = nullptr;
-         }
-         if (_display) {
-            wl_display_disconnect(_display);
-            _display = nullptr;
-         }
-      }
-
       bool guiSetWaylandParent(const char *token) {
-         if (!_window || !_embedding || !token)
+         if (!_window || !gVideo.embedding || !token)
             return false;
 
          auto *surface = static_cast<wl_surface *>(SDL_GetPointerProperty(
@@ -301,9 +333,9 @@ namespace {
          if (_embeddedSurface)
             clap_embedded_surface_v1_destroy(_embeddedSurface);
          _embeddedSurface =
-            clap_surface_embedding_v1_get_embedded_surface(_embedding, surface, token);
+            clap_surface_embedding_v1_get_embedded_surface(gVideo.embedding, surface, token);
          clap_embedded_surface_v1_add_listener(_embeddedSurface, &embeddedListener, this);
-         wl_display_flush(_display);
+         wl_display_flush(gVideo.display);
          return true;
       }
 
@@ -339,32 +371,39 @@ namespace {
          if (!_window)
             return;
 
-         SDL_PumpEvents();
+         // Every instance's timer pumps all the events, and the first one gets them all
          SDL_Event event;
          while (SDL_PollEvent(&event)) {
-            SDL_ConvertEventToRenderCoordinates(_renderer, &event);
-            switch (event.type) {
-            case SDL_EVENT_MOUSE_MOTION:
-               _mouseX = event.motion.x;
-               _mouseY = event.motion.y;
-               break;
-            case SDL_EVENT_WINDOW_MOUSE_LEAVE:
-               _mouseX = _mouseY = -1;
-               break;
-            case SDL_EVENT_MOUSE_BUTTON_DOWN:
-               ++_clicks;
-               _ripples.push_back({event.button.x, event.button.y, now(),
-                                   hue(float(_clicks) * 0.13f)});
-               break;
-            case SDL_EVENT_KEY_DOWN:
-               _lastKey = SDL_GetKeyName(event.key.key);
-               break;
-            default:
-               break;
-            }
+            SDL_Window *window = SDL_GetWindowFromEvent(&event);
+            for (auto plugin : gVideo.plugins)
+               if (window && plugin->_window == window)
+                  plugin->handleEvent(event);
          }
 
          draw(now() - _startTime);
+      }
+
+      void handleEvent(SDL_Event &event) {
+         SDL_ConvertEventToRenderCoordinates(_renderer, &event);
+         switch (event.type) {
+         case SDL_EVENT_MOUSE_MOTION:
+            _mouseX = event.motion.x;
+            _mouseY = event.motion.y;
+            break;
+         case SDL_EVENT_WINDOW_MOUSE_LEAVE:
+            _mouseX = _mouseY = -1;
+            break;
+         case SDL_EVENT_MOUSE_BUTTON_DOWN:
+            ++_clicks;
+            _ripples.push_back({event.button.x, event.button.y, now(),
+                                hue(float(_clicks) * 0.13f)});
+            break;
+         case SDL_EVENT_KEY_DOWN:
+            _lastKey = SDL_GetKeyName(event.key.key);
+            break;
+         default:
+            break;
+         }
       }
 
       static SDL_FColor hue(float h, float alpha = 1) {
@@ -512,9 +551,7 @@ namespace {
       double _sampleRate = 48000;
       double _phase = 0;
 
-      wl_display *_display = nullptr;
-      wl_registry *_registry = nullptr;
-      clap_surface_embedding_v1 *_embedding = nullptr;
+      bool _hasVideo = false; // one of gVideo's users
       clap_embedded_surface_v1 *_embeddedSurface = nullptr;
       SDL_Window *_window = nullptr;
       SDL_Renderer *_renderer = nullptr;

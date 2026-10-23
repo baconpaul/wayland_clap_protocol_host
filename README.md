@@ -111,7 +111,15 @@ wave. The host never starts audio, though.
 - `SDL_PROP_WINDOW_CREATE_WAYLAND_SURFACE_ROLE_CUSTOM_BOOLEAN` gives a role-less surface, which
   the plugin embeds itself.
 
-SDL's video subsystem is global to the process, so only one instance at a time can show its GUI.
+SDL's video subsystem is global to the process, so `sdl3-demo` also shows how a plugin shares one
+connection between its instances:
+- The first instance to create its GUI calls `open_connection()` and initializes SDL. The others
+  reuse that connection, and only embed their own surface with their own token. The last one shuts
+  SDL down and disconnects.
+- SDL's event queue is global too: every instance's timer pumps it, and each event goes to the
+  instance whose window it is for (`SDL_GetWindowFromEvent`).
+- The connection is only reused with the same `open_connection` function: another host in the
+  same process could run another compositor.
 
 ## Layout
 
@@ -179,8 +187,7 @@ The plugin is never activated.
 - **Cursor shapes** aren't forwarded: you always get the default arrow.
 - **No clipboard or drag and drop.** The `wl_output` is a placeholder (1920x1080, scale 1) which
   no surface enters.
-- **No plugin shares its connection yet:** each example plugin opens one per instance, and
-  `sdl3-demo` can only show one instance at a time. Closing and reopening a GUI is untested.
+- **Closing and reopening a GUI is untested.**
 - **GPU buffers are tested on AMD only.** On an AMD Renoir (radeonsi) under GNOME, `sdl3-demo`
   renders into tiled dmabufs which are forwarded and released as they should be. A system
   compositor which offers linux-dmabuf v3 only (as on a VM without 3D acceleration) isn't
