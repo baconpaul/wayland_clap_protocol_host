@@ -1,0 +1,52 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Ubuntu 26.04 (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    # The README's apt line, on the release it documents
+    container: ubuntu:26.04
+
+    steps:
+      - name: Install the dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates \
+            build-essential cmake ninja-build pkgconf git \
+            libwayland-dev wayland-protocols libdecor-0-dev \
+            libcairo2-dev libpango1.0-dev libsdl3-dev libxcb1-dev
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build the host and our plugins
+        run: cmake --build build
+
+      - name: Build the example plugins (free-audio/clap-plugins)
+        run: cmake --build build --target example-plugins
+
+      - name: Check the outputs
+        run: |
+          ls -la build/src/clap-wayland-host \
+                 build/plugins/wayland-shm-demo/wayland-shm-demo.clap \
+                 build/plugins/sdl3-demo/sdl3-demo.clap \
+                 build/example-plugins/clap-plugins.clap

@@ -1,0 +1,6 @@
+[submodule "libs/clap"]
+	path = libs/clap
+	url = https://github.com/free-audio/clap.git
+[submodule "libs/clap-wayland-experiment"]
+	path = libs/clap-wayland-experiment
+	url = https://github.com/free-audio/clap-wayland-experiment.git
