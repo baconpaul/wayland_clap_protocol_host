@@ -71,14 +71,23 @@ P=build/example-plugins/clap-plugins.clap
 ./build/src/clap-wayland-host $P com.github.free-audio.clap.synth
 ./build/src/clap-wayland-host $P com.github.free-audio.clap.check-wayland-embed
 ./build/src/clap-wayland-host $P bogus   # lists the plugin ids
+
+# Two plugins in one process, each in its own window
+./build/src/clap-wayland-host build/plugins/wayland-shm-demo/wayland-shm-demo.clap \
+    build/plugins/sdl3-demo/sdl3-demo.clap
 ```
 
-The arguments are `<plugin.clap> [plugin-id]`, with the first plugin of the file by default.
-Close the window or press Ctrl+C to quit. `WAYLAND_DEBUG=1` traces both sides: the plugin's
-requests to the nested compositor, and their forwarding (`->`) to the system compositor.
+The arguments are `<plugin.clap> [plugin-id]`, with the first plugin of the file by default, and
+may be repeated to load several plugins. A bundle given twice is loaded once, with two instances.
+Closing a window ends its plugin; close them all or press Ctrl+C to quit. `WAYLAND_DEBUG=1`
+traces both sides: the plugins' requests to the nested compositor, and their forwarding (`->`) to
+the system compositor.
 
-The host loads the plugin and opens its GUI. The window is a dark bar labelled "host area",
-which the host draws, with the plugin's surface embedded below it.
+The host loads each plugin and opens its GUI in a window of its own. The window has a bar
+labelled "host area", which the host draws, with the plugin's surface embedded below it. The bars
+are green, red, blue and amber, in the order of the command line. All the windows share one
+connection to the system compositor and one nested compositor, as the plugins in a DAW would, so
+a plugin may use one connection for all its instances.
 
 ## The example plugins
 
@@ -108,9 +117,9 @@ SDL's video subsystem is global to the process, so only one instance at a time c
 
 | Path | What |
 |------|------|
-| `src/main.cpp` | arguments and signals |
-| `src/host.*` | the CLAP host: loading, the host extensions (log, thread-check, timer-support, posix-fd-support, params, gui, the nested compositor), and the GUI sequence |
-| `src/wayland-window.*` | the host's toplevel, decorated by libdecor: the "host area" bar on top, the plugin's place below |
+| `src/main.cpp` | arguments, signals, and the main loop over the plugins |
+| `src/host.*` | the CLAP host, one per plugin instance: loading, the host extensions (log, thread-check, timer-support, posix-fd-support, params, gui, the nested compositor), and the GUI sequence |
+| `src/wayland-window.*` | the connection to the system compositor, and the host's toplevels, decorated by libdecor: the "host area" bar on top, the plugin's place below |
 | `src/nested-compositor.*` | the Wayland compositor which the plugins connect to |
 | `src/decorations.*` | the title bars which the compositor draws around the plugins' own windows |
 | `cmake/WaylandProtocols.cmake` | `wayland_target_protocols(target [SERVER] xml...)` around wayland-scanner |
@@ -136,11 +145,11 @@ The plugin is never activated.
 - **Connections:** `open_connection()` gives the plugin one end of a `socketpair()`.
 - **No rendering:** every plugin surface is forwarded to a "mirror" surface on the system
   compositor:
-  - **Embedded surface:** its mirror is a desync `wl_subsurface` of the host's window. Its place
-    is designated by a random token.
+  - **Embedded surface:** its mirror is a desync `wl_subsurface` of one of the host's windows.
+    Its place is designated by a random token, which any connection may present.
   - **The plugin's own windows** (`xdg_wm_base`): toplevels and popups are forwarded one to one.
-    Toplevels are parented to the host's window, and popups may use it as their parent through
-    `get_parent_surface`.
+    Toplevels are parented to the host's window where the plugin embeds, and popups may use it as
+    their parent through `get_parent_surface`.
   - **Server-side decorations** (`zxdg_decoration_manager_v1`): GNOME draws none, so the
     compositor draws the title bars itself. The plugin's content is a subsurface below the bar.
 - **Buffers:** nothing is ever copied.
@@ -170,7 +179,8 @@ The plugin is never activated.
 - **Cursor shapes** aren't forwarded: you always get the default arrow.
 - **No clipboard or drag and drop.** The `wl_output` is a placeholder (1920x1080, scale 1) which
   no surface enters.
-- **Only one plugin** at a time. Closing and reopening the GUI is untested.
+- **No plugin shares its connection yet:** each example plugin opens one per instance, and
+  `sdl3-demo` can only show one instance at a time. Closing and reopening a GUI is untested.
 - **GPU buffers are tested on AMD only.** On an AMD Renoir (radeonsi) under GNOME, `sdl3-demo`
   renders into tiled dmabufs which are forwarded and released as they should be. A system
   compositor which offers linux-dmabuf v3 only (as on a VM without 3D acceleration) isn't

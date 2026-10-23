@@ -4,14 +4,16 @@
 // embedded into the host's window (CLAP_WINDOW_API_WAYLAND_SURFACE_EMBEDDING_V1).
 //
 // It doesn't render anything itself: it forwards the plugins' surfaces to the system compositor.
-// - Each place where a plugin can embed its surface is a wl_subsurface of the host's window
+// The host may have several windows, all on one connection to the system compositor, and one
+// compositor serves them all: a plugin may use one connection for all its instances.
+// - Each place where a plugin can embed its surface is a wl_subsurface of one of the host's windows
 // - The plugins' other windows, toplevels and popups, are xdg-shell windows on the system
-//   compositor, kept above the host's window. Their popups may also use the host's window as
-//   their parent, through clap_embedded_surface_v1.get_parent_surface.
+//   compositor, kept above the host's window where the plugin embeds. Their popups may also use
+//   that window as their parent, through clap_embedded_surface_v1.get_parent_surface.
 // The plugins' shm pools are shared with the system compositor as is, so the pixels are never
 // copied. Input flows back from the system compositor to the plugins: the pointer goes to the
 // surface under it; the keyboard goes to a plugin's own window when it has the focus, and within
-// the host's window to the place which was clicked last.
+// a host's window to the place which was clicked last.
 //
 // It offers wl_compositor, wl_shm, wl_seat (pointer and keyboard), clap_surface_embedding_v1,
 // xdg_wm_base, and if the system compositor has them, wp_viewporter and
@@ -49,7 +51,6 @@ public:
    // The host's objects on the system compositor. They must outlive the compositor.
    struct Upstream {
       wl_display *display = nullptr;
-      wl_surface *parent = nullptr; // the host's toplevel surface
       wl_compositor *compositor = nullptr;
       wl_subcompositor *subcompositor = nullptr;
       wl_shm *shm = nullptr;
@@ -65,9 +66,15 @@ public:
       // answers xdg_wm_base's pings.
       xdg_wm_base *wmBase = nullptr;
       uint32_t wmBaseVersion = 0;
-      xdg_surface *parentXdgSurface = nullptr; // the host's window, as popups' parent
-      xdg_toplevel *parentToplevel = nullptr;  // the host's window, as dialogs' parent
    };
+
+   // A window of the host, on the same connection as Upstream's objects
+   struct Window {
+      wl_surface *surface = nullptr;     // its toplevel surface, the places' parent
+      xdg_surface *xdgSurface = nullptr; // as popups' parent
+      xdg_toplevel *toplevel = nullptr;  // as dialogs' parent
+   };
+   using WindowId = uint32_t;
 
    NestedCompositor();
    ~NestedCompositor();
@@ -82,14 +89,21 @@ public:
    // the caller owns, or -1. [main thread]
    int openConnection();
 
-   // Reserves a place at (x, y) in the parent surface, and returns the embedding token which
-   // designates it. The caller commits the parent surface to apply the position. [main thread]
-   std::string createPlace(int32_t x, int32_t y);
+   // Adds a window which the plugins can embed into. [main thread]
+   WindowId addWindow(const Window &window);
 
-   // Where the parent surface's (0, 0) is within the host window's geometry, for example below a
-   // title bar which the host draws itself. The plugins place their popups relative to the
-   // window's geometry. [main thread]
-   void setParentOrigin(int32_t x, int32_t y);
+   // Ends the embeddings into the window's places: their plugins get clap_embedded_surface_v1
+   // .closed. The host calls it before it destroys the window. [main thread]
+   void removeWindow(WindowId window);
+
+   // Reserves a place at (x, y) in the window's surface, and returns the embedding token which
+   // designates it. The caller commits the window's surface to apply the position. [main thread]
+   std::string createPlace(WindowId window, int32_t x, int32_t y);
+
+   // Where the window surface's (0, 0) is within the window's geometry, for example below a title
+   // bar which the host draws itself. The plugins place their popups relative to the window's
+   // geometry. [main thread]
+   void setParentOrigin(WindowId window, int32_t x, int32_t y);
 
 private:
    struct Impl;

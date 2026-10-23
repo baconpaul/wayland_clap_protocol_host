@@ -1,7 +1,9 @@
 #pragma once
 
-// A minimal CLAP host which embeds one plugin's GUI into its Wayland window, through a nested
-// compositor (CLAP_WINDOW_API_WAYLAND_SURFACE_EMBEDDING_V1, see clap-wayland-experiment).
+// A minimal CLAP host which embeds a plugin's GUI into a Wayland window of its own, through a
+// nested compositor (CLAP_WINDOW_API_WAYLAND_SURFACE_EMBEDDING_V1, see clap-wayland-experiment).
+// There is one Host per plugin instance; they share the connection to the system compositor and
+// the nested compositor, as the plugins in a DAW would.
 //
 // The plugin isn't activated: there is no audio. The parameter changes made in the GUI are
 // collected with clap_plugin_params.flush() and printed.
@@ -18,21 +20,52 @@
 #include "nested-compositor.h"
 #include "wayland-window.h"
 
+// A .clap bundle, loaded once for all its instances
+class PluginLibrary final {
+public:
+   PluginLibrary() = default;
+   ~PluginLibrary();
+
+   PluginLibrary(const PluginLibrary &) = delete;
+   PluginLibrary &operator=(const PluginLibrary &) = delete;
+
+   bool load(const std::string &path);
+
+   // With an empty id, the first plugin; with an unknown one, prints those it has
+   const clap_plugin_descriptor *find(const std::string &pluginId) const;
+
+   const clap_plugin_factory *factory() const { return _factory; }
+
+private:
+   std::string _path;
+   void *_library = nullptr;
+   const clap_plugin_entry *_entry = nullptr;
+   const clap_plugin_factory *_factory = nullptr;
+};
+
 class Host final {
 public:
-   Host();
+   using Clock = std::chrono::steady_clock;
+
+   // The connection and the compositor are shared by all the hosts, and outlive them
+   Host(WaylandConnection &connection, NestedCompositor &compositor, const WaylandWindow::Colors &colors);
    ~Host();
 
    Host(const Host &) = delete;
    Host &operator=(const Host &) = delete;
 
-   // Loads the bundle; prints the plugins it contains. With an empty id, picks the first one.
-   bool load(const std::string &path, std::string pluginId);
+   bool create(const PluginLibrary &library, const clap_plugin_descriptor *descriptor);
    bool openGui();
-   void run();
+
+   bool isOpen() const { return _window && _window->isOpen(); }
+
+   // The main loop's work, which main() runs for all the hosts
+   void idle(); // callbacks, timers, parameter flushes
+   int nextTimeoutMs() const;
+   void addPollFds(std::vector<pollfd> &fds) const;
+   void runPosixFds(const pollfd *fds, size_t count); // those which addPollFds() added
 
 private:
-   using Clock = std::chrono::steady_clock;
 
    static Host &self(const clap_host *host) { return *static_cast<Host *>(host->host_data); }
 
@@ -40,8 +73,6 @@ private:
    bool isMainThread() const { return std::this_thread::get_id() == _mainThread; }
 
    void runTimers();
-   int nextTimeoutMs() const;
-   void runPosixFds(const std::vector<pollfd> &fds);
    void flushParams();
 
    struct Timer {
@@ -67,9 +98,11 @@ private:
    clap_host_gui _hostGui;
    clap_host_gui_wayland_nested_compositor _hostNestedCompositor;
 
+   WaylandConnection &_connection;
+   NestedCompositor &_compositor;
+   const WaylandWindow::Colors _colors;
+
    // What the plugin gives us
-   void *_library = nullptr;
-   const clap_plugin_entry *_entry = nullptr;
    const clap_plugin *_plugin = nullptr;
    const clap_plugin_gui *_gui = nullptr;
    const clap_plugin_gui_wayland_nested_compositor *_guiNestedCompositor = nullptr;
@@ -86,7 +119,6 @@ private:
    bool _isCallbackRequested = false;
    bool _isFlushRequested = false;
 
-   // The window first: the compositor forwards the plugin's surface into it
    std::unique_ptr<WaylandWindow> _window;
-   std::unique_ptr<NestedCompositor> _compositor;
+   NestedCompositor::WindowId _windowId = UINT32_MAX; // none, until openGui()
 };

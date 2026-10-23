@@ -1,15 +1,57 @@
 #include "host.h"
 
 #include <algorithm>
-#include <csignal>
 #include <cstring>
 #include <iostream>
 
 #include <dlfcn.h>
 
-extern volatile std::sig_atomic_t gQuitRequested; // main.cpp
+PluginLibrary::~PluginLibrary() {
+   if (_entry)
+      _entry->deinit();
+   if (_library)
+      dlclose(_library);
+}
 
-Host::Host() {
+bool PluginLibrary::load(const std::string &path) {
+   _path = path;
+   _library = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+   if (!_library) {
+      std::cerr << "failed to load " << path << ": " << dlerror() << "\n";
+      return false;
+   }
+
+   auto entry = static_cast<const clap_plugin_entry *>(dlsym(_library, "clap_entry"));
+   if (!entry || !clap_version_is_compatible(entry->clap_version) || !entry->init(path.c_str())) {
+      std::cerr << path << " has no usable clap_entry\n";
+      return false;
+   }
+   _entry = entry;
+
+   _factory = static_cast<const clap_plugin_factory *>(entry->get_factory(CLAP_PLUGIN_FACTORY_ID));
+   if (!_factory || _factory->get_plugin_count(_factory) == 0) {
+      std::cerr << "no plugin factory, or no plugins in " << path << "\n";
+      return false;
+   }
+   return true;
+}
+
+const clap_plugin_descriptor *PluginLibrary::find(const std::string &pluginId) const {
+   for (uint32_t i = 0; i < _factory->get_plugin_count(_factory); ++i) {
+      auto d = _factory->get_plugin_descriptor(_factory, i);
+      if (pluginId.empty() ? i == 0 : pluginId == d->id)
+         return d;
+   }
+   std::cerr << "no plugin " << pluginId << " in " << _path << ", it has:\n";
+   for (uint32_t i = 0; i < _factory->get_plugin_count(_factory); ++i) {
+      auto d = _factory->get_plugin_descriptor(_factory, i);
+      std::cerr << "  " << d->id << "  (" << d->name << ")\n";
+   }
+   return nullptr;
+}
+
+Host::Host(WaylandConnection &connection, NestedCompositor &compositor, const WaylandWindow::Colors &colors)
+   : _connection(connection), _compositor(compositor), _colors(colors) {
    _host = {
       .clap_version = CLAP_VERSION,
       .host_data = this,
@@ -90,10 +132,7 @@ Host::Host() {
    };
 
    _hostNestedCompositor = {
-      .open_connection = [](const clap_host *h) {
-         auto &host = self(h);
-         return host._compositor ? host._compositor->openConnection() : -1;
-      },
+      .open_connection = [](const clap_host *h) { return self(h)._compositor.openConnection(); },
    };
 }
 
@@ -102,13 +141,10 @@ Host::~Host() {
       _gui->destroy(_plugin);
    if (_plugin)
       _plugin->destroy(_plugin);
-   // The plugin is disconnected now
-   if (_compositor)
-      _compositor->stop();
-   if (_entry)
-      _entry->deinit();
-   if (_library)
-      dlclose(_library);
+   // The plugin may keep its connection for its other instances: the compositor ends what is
+   // still embedded into our window before it goes
+   if (_window)
+      _compositor.removeWindow(_windowId);
 }
 
 const void *Host::getExtension(const char *id) const {
@@ -124,48 +160,16 @@ const void *Host::getExtension(const char *id) const {
       return &_hostParams;
    if (!strcmp(id, CLAP_EXT_GUI))
       return &_hostGui;
-   // The plugins ask for it in init(), before we start the compositor in openGui()
+   // The plugins ask for it in init()
    if (!strcmp(id, CLAP_EXT_GUI_WAYLAND_NESTED_COMPOSITOR))
       return &_hostNestedCompositor;
    return nullptr;
 }
 
-bool Host::load(const std::string &path, std::string pluginId) {
-   _library = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-   if (!_library) {
-      std::cerr << "failed to load " << path << ": " << dlerror() << "\n";
-      return false;
-   }
-
-   auto entry = static_cast<const clap_plugin_entry *>(dlsym(_library, "clap_entry"));
-   if (!entry || !clap_version_is_compatible(entry->clap_version) || !entry->init(path.c_str())) {
-      std::cerr << path << " has no usable clap_entry\n";
-      return false;
-   }
-   _entry = entry;
-
-   auto factory = static_cast<const clap_plugin_factory *>(entry->get_factory(CLAP_PLUGIN_FACTORY_ID));
-   if (!factory || factory->get_plugin_count(factory) == 0) {
-      std::cerr << "no plugin factory, or no plugins\n";
-      return false;
-   }
-
-   const clap_plugin_descriptor *descriptor = nullptr;
-   for (uint32_t i = 0; i < factory->get_plugin_count(factory); ++i) {
-      auto d = factory->get_plugin_descriptor(factory, i);
-      if (pluginId.empty() ? i == 0 : pluginId == d->id)
-         descriptor = d;
-   }
-   if (!descriptor) {
-      std::cerr << "no plugin " << pluginId << " in " << path << ", it has:\n";
-      for (uint32_t i = 0; i < factory->get_plugin_count(factory); ++i) {
-         auto d = factory->get_plugin_descriptor(factory, i);
-         std::cerr << "  " << d->id << "  (" << d->name << ")\n";
-      }
-      return false;
-   }
+bool Host::create(const PluginLibrary &library, const clap_plugin_descriptor *descriptor) {
    _pluginName = descriptor->name;
 
+   auto factory = library.factory();
    _plugin = factory->create_plugin(factory, &_host, descriptor->id);
    if (!_plugin || !_plugin->init(_plugin)) {
       std::cerr << "failed to create " << descriptor->id << "\n";
@@ -197,16 +201,11 @@ bool Host::openGui() {
    constexpr const char *api = CLAP_WINDOW_API_WAYLAND_SURFACE_EMBEDDING_V1;
 
    // A placeholder size until the plugin tells its own
-   _window = std::make_unique<WaylandWindow>();
+   _window = std::make_unique<WaylandWindow>(_connection, _colors);
    const std::string title = _pluginName + " - CLAP Wayland Host";
    if (!_window->open(title.c_str(), 400, 300))
       return false;
-
-   _compositor = std::make_unique<NestedCompositor>();
-   if (!_compositor->start(_window->upstream())) {
-      _compositor.reset();
-      return false;
-   }
+   _windowId = _compositor.addWindow(_window->nested());
 
    if (!_gui->is_api_supported(_plugin, api, false)) {
       std::cerr << "the plugin doesn't support " << api << "\n";
@@ -230,7 +229,7 @@ bool Host::openGui() {
    _window->resize(width, height);
 
    // The place below our bar, which the token designates
-   const std::string token = _compositor->createPlace(0, WaylandWindow::kBarHeight);
+   const std::string token = _compositor.createPlace(_windowId, 0, WaylandWindow::kBarHeight);
    _window->commit();
 
    // The plugin places its popups relative to our window's geometry, which libdecor's title bar
@@ -238,7 +237,7 @@ bool Host::openGui() {
    int32_t originX = 0;
    int32_t originY = 0;
    _window->contentOrigin(originX, originY);
-   _compositor->setParentOrigin(originX, originY);
+   _compositor.setParentOrigin(_windowId, originX, originY);
 
    if (!_guiNestedCompositor->set_parent(_plugin, token.c_str())) {
       std::cerr << "the plugin failed to embed its GUI\n";
@@ -246,33 +245,26 @@ bool Host::openGui() {
    }
    if (!_gui->show(_plugin))
       std::cerr << "the plugin failed to show its GUI\n";
-
-   std::cout << "close the window (or Ctrl+C) to quit\n";
    return true;
 }
 
-void Host::run() {
-   std::vector<pollfd> fds;
-   while (_window->isOpen() && !gQuitRequested) {
-      if (_isCallbackRequested) {
-         _isCallbackRequested = false;
-         _plugin->on_main_thread(_plugin);
-      }
-      runTimers();
-      flushParams();
+void Host::idle() {
+   if (_isCallbackRequested) {
+      _isCallbackRequested = false;
+      _plugin->on_main_thread(_plugin);
+   }
+   runTimers();
+   flushParams();
+}
 
-      fds.clear();
-      for (auto &f : _posixFds) {
-         short events = 0;
-         if (f.flags & CLAP_POSIX_FD_READ)
-            events |= POLLIN;
-         if (f.flags & CLAP_POSIX_FD_WRITE)
-            events |= POLLOUT;
-         fds.push_back({.fd = f.fd, .events = events, .revents = 0});
-      }
-
-      _window->dispatch(nextTimeoutMs(), fds);
-      runPosixFds(fds);
+void Host::addPollFds(std::vector<pollfd> &fds) const {
+   for (auto &f : _posixFds) {
+      short events = 0;
+      if (f.flags & CLAP_POSIX_FD_READ)
+         events |= POLLIN;
+      if (f.flags & CLAP_POSIX_FD_WRITE)
+         events |= POLLOUT;
+      fds.push_back({.fd = f.fd, .events = events, .revents = 0});
    }
 }
 
@@ -303,11 +295,12 @@ int Host::nextTimeoutMs() const {
    return std::max<int>(0, delay.count());
 }
 
-void Host::runPosixFds(const std::vector<pollfd> &fds) {
+void Host::runPosixFds(const pollfd *fds, size_t count) {
    if (!_posixFdSupport)
       return;
 
-   for (auto &p : fds) {
+   for (size_t i = 0; i < count; ++i) {
+      auto &p = fds[i];
       clap_posix_fd_flags_t flags = 0;
       if (p.revents & POLLIN)
          flags |= CLAP_POSIX_FD_READ;

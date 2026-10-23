@@ -17,10 +17,7 @@
 #include "xdg-shell-client-protocol.h"
 
 namespace {
-   constexpr uint32_t kBarColor = 0x24343c;
-   constexpr uint32_t kBarAccent = 0x4fb3a0;
    constexpr uint32_t kBackgroundColor = 0x202020;
-   constexpr uint32_t kTextColor = 0xbfe6dd;
    constexpr const char *kBarText = "host area";
 
    // A 5x7 bitmap font, only the letters which we draw: one byte per row, the high bit on the left
@@ -65,13 +62,7 @@ namespace {
    }
 } // namespace
 
-WaylandWindow::~WaylandWindow() {
-   if (_buffer)
-      wl_buffer_destroy(_buffer);
-   if (_frame)
-      libdecor_frame_unref(_frame);
-   if (_surface)
-      wl_surface_destroy(_surface);
+WaylandConnection::~WaylandConnection() {
    if (_decor)
       libdecor_unref(_decor);
    if (_cursorShapeDevice)
@@ -102,16 +93,13 @@ WaylandWindow::~WaylandWindow() {
       wl_display_disconnect(_display);
 }
 
-bool WaylandWindow::open(const char *title, uint32_t width, uint32_t height) {
-   _width = width;
-   _height = height + kBarHeight;
-
+bool WaylandConnection::open() {
    _display = wl_display_connect(nullptr);
    if (!_display) {
       std::cerr << "failed to connect to the Wayland compositor (is WAYLAND_DISPLAY set?)\n";
       return false;
    }
-   _isOpen = true;
+   _isConnected = true;
 
    static const wl_registry_listener registryListener = {
       .global = [](void *data, wl_registry *registry, uint32_t name, const char *interface,
@@ -139,6 +127,29 @@ bool WaylandWindow::open(const char *title, uint32_t width, uint32_t height) {
       std::cerr << "libdecor failed to initialize\n";
       return false;
    }
+   return true;
+}
+
+WaylandWindow::WaylandWindow(WaylandConnection &connection, const Colors &colors)
+   : _connection(connection), _colors(colors) {
+   _connection._windows.push_back(this);
+}
+
+WaylandWindow::~WaylandWindow() {
+   std::erase(_connection._windows, this);
+   if (_buffer)
+      wl_buffer_destroy(_buffer);
+   if (_frame)
+      libdecor_frame_unref(_frame);
+   if (_surface)
+      wl_surface_destroy(_surface);
+   wl_display_flush(_connection._display);
+}
+
+bool WaylandWindow::open(const char *title, uint32_t width, uint32_t height) {
+   _width = width;
+   _height = height + kBarHeight;
+   _isOpen = true;
 
    static libdecor_frame_interface frameInterface = {
       .configure = [](libdecor_frame *frame, libdecor_configuration *configuration, void *data) {
@@ -150,8 +161,8 @@ bool WaylandWindow::open(const char *title, uint32_t width, uint32_t height) {
       .dismiss_popup = [](libdecor_frame *, const char *, void *) {},
    };
 
-   _surface = wl_compositor_create_surface(_compositor);
-   _frame = libdecor_decorate(_decor, _surface, &frameInterface, this);
+   _surface = wl_compositor_create_surface(_connection._compositor);
+   _frame = libdecor_decorate(_connection._decor, _surface, &frameInterface, this);
    libdecor_frame_set_title(_frame, title);
    libdecor_frame_set_app_id(_frame, "clap-wayland-host");
    // The plugin decides the size, see resize(); maximizing would only add empty space
@@ -161,11 +172,11 @@ bool WaylandWindow::open(const char *title, uint32_t width, uint32_t height) {
    libdecor_frame_set_max_content_size(_frame, _width, _height);
    libdecor_frame_map(_frame);
 
-   while (_isOpen && !_isConfigured)
-      if (libdecor_dispatch(_decor, -1) < 0)
+   while (isOpen() && !_isConfigured)
+      if (libdecor_dispatch(_connection._decor, -1) < 0)
          return false;
 
-   return _isOpen;
+   return isOpen();
 }
 
 // The compositor's size doesn't matter: our content has the plugin's size
@@ -196,10 +207,9 @@ void WaylandWindow::resize(uint32_t width, uint32_t height) {
    redraw();
 }
 
-NestedCompositor::Upstream WaylandWindow::upstream() const {
+NestedCompositor::Upstream WaylandConnection::upstream() const {
    return {
       .display = _display,
-      .parent = _surface,
       .compositor = _compositor,
       .subcompositor = _subcompositor,
       .shm = _shm,
@@ -211,8 +221,14 @@ NestedCompositor::Upstream WaylandWindow::upstream() const {
       .cursorShapeManager = _cursorShapeManager,
       .wmBase = _wmBase,
       .wmBaseVersion = _wmBaseVersion,
-      .parentXdgSurface = libdecor_frame_get_xdg_surface(_frame),
-      .parentToplevel = libdecor_frame_get_xdg_toplevel(_frame),
+   };
+}
+
+NestedCompositor::Window WaylandWindow::nested() const {
+   return {
+      .surface = _surface,
+      .xdgSurface = libdecor_frame_get_xdg_surface(_frame),
+      .toplevel = libdecor_frame_get_xdg_toplevel(_frame),
    };
 }
 
@@ -226,10 +242,10 @@ void WaylandWindow::contentOrigin(int32_t &x, int32_t &y) const {
 
 void WaylandWindow::commit() {
    wl_surface_commit(_surface);
-   wl_display_flush(_display);
+   wl_display_flush(_connection._display);
 }
 
-void WaylandWindow::onGlobal(wl_registry *registry, uint32_t name, const char *interface, uint32_t version) {
+void WaylandConnection::onGlobal(wl_registry *registry, uint32_t name, const char *interface, uint32_t version) {
    auto bind = [&](const wl_interface *iface, uint32_t v) { return wl_registry_bind(registry, name, iface, v); };
 
    if (!strcmp(interface, wl_compositor_interface.name) && version >= 4) {
@@ -272,15 +288,22 @@ void WaylandWindow::onGlobal(wl_registry *registry, uint32_t name, const char *i
    }
 }
 
-// Our own pointer, for the cursor over the bar; the nested compositor has its own one for the
-// plugin's area
-void WaylandWindow::onSeatCapabilities(uint32_t capabilities) {
+bool WaylandConnection::isOurs(wl_surface *surface) const {
+   for (auto w : _windows)
+      if (w->_surface == surface)
+         return true;
+   return false;
+}
+
+// Our own pointer, for the cursor over the bars; the nested compositor has its own one for the
+// plugins' areas
+void WaylandConnection::onSeatCapabilities(uint32_t capabilities) {
    static const wl_pointer_listener pointerListener = {
       .enter =
          [](void *data, wl_pointer *, uint32_t serial, wl_surface *surface, wl_fixed_t, wl_fixed_t) {
-            auto &w = self(data);
-            if (surface == w._surface && w._cursorShapeDevice)
-               wp_cursor_shape_device_v1_set_shape(w._cursorShapeDevice, serial,
+            auto &c = self(data);
+            if (c.isOurs(surface) && c._cursorShapeDevice)
+               wp_cursor_shape_device_v1_set_shape(c._cursorShapeDevice, serial,
                                                    WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
          },
       .leave = [](void *, wl_pointer *, uint32_t, wl_surface *) {},
@@ -322,17 +345,17 @@ void WaylandWindow::redraw() {
    for (uint32_t y = 0; y < _height; ++y) {
       uint32_t color = kBackgroundColor;
       if (y < kBarHeight - 2)
-         color = kBarColor;
+         color = _colors.bar;
       else if (y < kBarHeight)
-         color = kBarAccent;
+         color = _colors.accent;
       std::fill_n(pixels + size_t(y) * _width, _width, color);
    }
    // 14px tall, centered in the bar above the accent line
    constexpr int kTextScale = 2;
-   drawText(pixels, _width, _height, 12, (kBarHeight - 2 - 7 * kTextScale) / 2, kTextScale, kBarText, kTextColor);
+   drawText(pixels, _width, _height, 12, (kBarHeight - 2 - 7 * kTextScale) / 2, kTextScale, kBarText, _colors.text);
    munmap(pixels, size);
 
-   auto pool = wl_shm_create_pool(_shm, fd, size);
+   auto pool = wl_shm_create_pool(_connection._shm, fd, size);
    auto buffer = wl_shm_pool_create_buffer(pool, 0, _width, _height, stride, WL_SHM_FORMAT_XRGB8888);
    wl_shm_pool_destroy(pool);
    close(fd);
@@ -344,10 +367,10 @@ void WaylandWindow::redraw() {
    if (_buffer)
       wl_buffer_destroy(_buffer);
    _buffer = buffer;
-   wl_display_flush(_display);
+   wl_display_flush(_connection._display);
 }
 
-void WaylandWindow::dispatch(int timeoutMs, std::vector<pollfd> &extraFds) {
+void WaylandConnection::dispatch(int timeoutMs, std::vector<pollfd> &extraFds) {
    while (wl_display_prepare_read(_display) != 0)
       wl_display_dispatch_pending(_display);
    wl_display_flush(_display);
@@ -360,7 +383,7 @@ void WaylandWindow::dispatch(int timeoutMs, std::vector<pollfd> &extraFds) {
    const int ready = poll(fds.data(), fds.size(), timeoutMs);
    if (ready > 0 && (fds[0].revents & POLLIN)) {
       if (wl_display_read_events(_display) < 0)
-         _isOpen = false;
+         _isConnected = false;
    } else
       wl_display_cancel_read(_display);
 
@@ -368,9 +391,9 @@ void WaylandWindow::dispatch(int timeoutMs, std::vector<pollfd> &extraFds) {
       extraFds[i].revents = ready > 0 ? fds[i + 1].revents : 0;
 
    if (wl_display_dispatch_pending(_display) < 0)
-      _isOpen = false;
+      _isConnected = false;
 
-   // libdecor's GTK plugin has its own main loop work, for example to redraw the title bar
-   if (_isOpen && libdecor_dispatch(_decor, 0) < 0)
-      _isOpen = false;
+   // libdecor's GTK plugin has its own main loop work, for example to redraw the title bars
+   if (_isConnected && libdecor_dispatch(_decor, 0) < 0)
+      _isConnected = false;
 }

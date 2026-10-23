@@ -95,8 +95,17 @@ namespace {
       }
    };
 
-   // A place in the host's window, where one plugin surface can be embedded
+   // A window of the host. It stays until our teardown, since the plugins' objects may refer to
+   // it: once the host removes it, up is all null.
+   struct HostWindow {
+      NestedCompositor::Window up;
+      int32_t originX = 0; // of the surface, within the window's geometry
+      int32_t originY = 0;
+   };
+
+   // A place in one of the host's windows, where one plugin surface can be embedded
    struct Place {
+      HostWindow *window = nullptr;
       std::string token;
       int32_t x = 0;
       int32_t y = 0;
@@ -226,12 +235,12 @@ namespace {
       int32_t parentOffsetY = 0; // the parent's title bar, which the plugin doesn't know of
    };
 
-   // From get_parent_surface and get_parent_toplevel: stands for the host's window
+   // From get_parent_surface and get_parent_toplevel: stands for the host's window around the
+   // embedded surface, or for none if the embedding ended
    struct HostWindowRef {
       Kind kind;
+      HostWindow *window;
    };
-   HostWindowRef hostWindowSurfaceRef{Kind::hostWindowSurface};
-   HostWindowRef hostWindowToplevelRef{Kind::hostWindowToplevel};
 
    Kind kindOf(wl_resource *res) { return *static_cast<Kind *>(wl_resource_get_user_data(res)); }
 
@@ -311,7 +320,7 @@ namespace {
 
       wl_keyboard *keyboard = nullptr;
       wl_surface *keyboardUp = nullptr;   // where the system compositor's keyboard focus is
-      Place *keyboardPlace = nullptr;     // within the host's window, the place clicked last
+      Place *keyboardPlace = nullptr;     // within the host's windows, the place clicked last
       Surface *keyboardFocus = nullptr;   // where we sent enter
       int keymapFd = -1;
       uint32_t keymapFormat = 0;
@@ -335,9 +344,9 @@ namespace {
       std::mutex tasksMutex;
       std::vector<std::function<void()>> tasks;
 
-      std::vector<std::unique_ptr<Place>> places; // only touched by our thread
-      int32_t parentOriginX = 0;
-      int32_t parentOriginY = 0;
+      // Only touched by our thread
+      std::vector<std::unique_ptr<HostWindow>> windows; // by id
+      std::vector<std::unique_ptr<Place>> places;
 
       void post(std::function<void()> task) {
          {
@@ -353,8 +362,10 @@ namespace {
       void teardown();
 
       void createGlobals();
-      Place *createPlace(int32_t x, int32_t y);
-      void setParentOrigin(int32_t x, int32_t y);
+      void removeWindow(HostWindow &w);
+      Place *createPlace(HostWindow &w, int32_t x, int32_t y);
+      void setParentOrigin(HostWindow &w, int32_t x, int32_t y);
+      xdg_toplevel *defaultParentFor(wl_resource *res) const;
       Place *findPlace(const char *token) {
          for (auto &p : places)
             if (p->token == token)
@@ -700,7 +711,7 @@ namespace {
             target = it->second->shown; // one of the plugins' own windows
          else if (auto f = frames.find(keyboardUp); f != frames.end())
             target = f->second->surface; // one of them, with our title bar
-         else if (keyboardUp == upstream.parent && keyboardPlace)
+         else if (keyboardPlace && keyboardUp == keyboardPlace->window->up.surface)
             target = keyboardPlace->mirror.shown;
       }
 
@@ -729,9 +740,8 @@ namespace {
          [](void *data, wl_keyboard *, uint32_t serial, wl_surface *surface, wl_array *) {
             auto &impl = implOf(data);
             impl.lastUpstreamSerial = serial;
-            // The host's window is all one surface for this: its decorations are subsurfaces
-            impl.keyboardUp =
-               impl.mirrors.count(surface) || impl.frames.count(surface) ? surface : impl.upstream.parent;
+            // A host's window is all one surface for this: its decorations are subsurfaces
+            impl.keyboardUp = surface;
             impl.updateKeyboardFocus();
          },
       .leave =
@@ -901,7 +911,7 @@ namespace {
       // What the plugin asked for until now. Its windows stay above the host's window, unless
       // it puts them above one of its own.
       const int32_t bar = t.titleBarHeight();
-      if (auto parent = t.hasParent && t.parent ? t.parent : upstream.parentToplevel)
+      if (auto parent = t.hasParent && t.parent ? t.parent : defaultParentFor(t.res))
          xdg_toplevel_set_parent(t.up, parent);
       if (!t.title.empty())
          xdg_toplevel_set_title(t.up, t.title.c_str());
@@ -1067,8 +1077,21 @@ namespace {
    // Relative to the host window's geometry, for the plugin's popups
    void Impl::sendPosition(Surface &s) {
       if (s.place && s.embeddedRes)
-         clap_embedded_surface_v1_send_position(s.embeddedRes, parentOriginX + s.place->x,
-                                                parentOriginY + s.place->y);
+         clap_embedded_surface_v1_send_position(s.embeddedRes, s.place->window->originX + s.place->x,
+                                                s.place->window->originY + s.place->y);
+   }
+
+   // A plugin's toplevel stays above the host's window where the plugin embeds, or else above
+   // the first one
+   xdg_toplevel *Impl::defaultParentFor(wl_resource *res) const {
+      wl_client *client = wl_resource_get_client(res);
+      for (auto &p : places)
+         if (p->mirror.shown && wl_resource_get_client(p->mirror.shown->res) == client)
+            return p->window->up.toplevel;
+      for (auto &w : windows)
+         if (w->up.toplevel)
+            return w->up.toplevel;
+      return nullptr;
    }
 
    void Impl::sendScale(Surface &s) {
@@ -1718,12 +1741,17 @@ namespace {
       .destroy = destroyResource,
       .set_parent =
          [](wl_client *, wl_resource *r, wl_resource *parent) {
-            // One of the plugin's windows, or the host's window
+            // One of the plugin's windows, or a host's window
             auto &t = toplevelOf(r);
             t.hasParent = true;
-            t.parent = parent && kindOf(parent) == Kind::toplevel ? dataOf<Toplevel>(parent)->up : nullptr;
+            t.parent = nullptr;
+            if (parent && kindOf(parent) == Kind::toplevel)
+               t.parent = dataOf<Toplevel>(parent)->up;
+            else if (parent && kindOf(parent) == Kind::hostWindowToplevel)
+               if (auto w = dataOf<HostWindowRef>(parent)->window)
+                  t.parent = w->up.toplevel;
             if (t.up)
-               xdg_toplevel_set_parent(t.up, t.parent ? t.parent : t.impl->upstream.parentToplevel);
+               xdg_toplevel_set_parent(t.up, t.parent ? t.parent : t.impl->defaultParentFor(r));
          },
       .set_title =
          [](wl_client *, wl_resource *r, const char *title) {
@@ -1889,8 +1917,10 @@ namespace {
                   p->parent = parentXs->popup;
                   parentXs->popup->children.push_back(p);
                }
-            } else if (parent && kindOf(parent) == Kind::hostWindowSurface)
-               upParent = impl.upstream.parentXdgSurface;
+            } else if (parent && kindOf(parent) == Kind::hostWindowSurface) {
+               if (auto w = dataOf<HostWindowRef>(parent)->window)
+                  upParent = w->up.xdgSurface;
+            }
 
             if (!xs->surface || !upParent) {
                // Without a parent, the compositor can't place it: dismiss it right away
@@ -2032,7 +2062,7 @@ namespace {
    // get_parent_surface and get_parent_toplevel: objects which only stand for the host's window,
    // as parents. The compositor ignores their requests but destroy, which is opcode 0 on both.
    void createHostWindowRef(wl_client *client, const wl_interface *interface, uint32_t version, uint32_t id,
-                            HostWindowRef &ref) {
+                            Kind kind, Surface *s) {
       auto r = wl_resource_create(client, interface, version, id);
       wl_resource_set_dispatcher(
          r,
@@ -2041,7 +2071,8 @@ namespace {
                wl_resource_destroy(static_cast<wl_resource *>(target));
             return 0;
          },
-         nullptr, &ref, nullptr);
+         nullptr, new HostWindowRef{kind, s && s->place ? s->place->window : nullptr},
+         [](wl_resource *r) { delete dataOf<HostWindowRef>(r); });
    }
 
    // As the plugin's xdg_wm_base, which it uses with these objects
@@ -2053,13 +2084,13 @@ namespace {
          [](wl_client *client, wl_resource *r, uint32_t id) {
             auto s = dataOf<Surface>(r);
             createHostWindowRef(client, &xdg_surface_interface, s ? xdgVersionFor(*s->impl) : 1, id,
-                                hostWindowSurfaceRef);
+                                Kind::hostWindowSurface, s);
          },
       .get_parent_toplevel =
          [](wl_client *client, wl_resource *r, uint32_t id) {
             auto s = dataOf<Surface>(r);
             createHostWindowRef(client, &xdg_toplevel_interface, s ? xdgVersionFor(*s->impl) : 1, id,
-                                hostWindowToplevelRef);
+                                Kind::hostWindowToplevel, s);
          },
    };
 
@@ -2202,14 +2233,42 @@ namespace {
    // Thread & loop //
    ///////////////////
 
-   Place *Impl::createPlace(int32_t x, int32_t y) {
+   void Impl::removeWindow(HostWindow &w) {
+      for (auto it = places.begin(); it != places.end();) {
+         auto &p = **it;
+         if (p.window != &w) {
+            ++it;
+            continue;
+         }
+         if (auto s = p.mirror.shown) {
+            unembed(*s);
+            // The plugin should destroy the object: we ignore its requests from now on
+            clap_embedded_surface_v1_send_closed(s->embeddedRes);
+         }
+         if (keyboardPlace == &p)
+            keyboardPlace = nullptr;
+         wl_subsurface_destroy(p.subsurface);
+         destroyMirror(p.mirror);
+         it = places.erase(it);
+      }
+      if (keyboardUp == w.up.surface)
+         keyboardUp = nullptr;
+      updateKeyboardFocus();
+      w.up = {};
+   }
+
+   Place *Impl::createPlace(HostWindow &w, int32_t x, int32_t y) {
+      if (!w.up.surface)
+         return nullptr;
+
       auto p = std::make_unique<Place>();
+      p->window = &w;
       p->token = randomToken();
       p->x = x;
       p->y = y;
 
       initMirror(p->mirror);
-      p->subsurface = wl_subcompositor_get_subsurface(subcompositor, p->mirror.up, upstream.parent);
+      p->subsurface = wl_subcompositor_get_subsurface(subcompositor, p->mirror.up, w.up.surface);
       wl_subsurface_set_position(p->subsurface, x, y);
       // The plugin's commits show right away, without waiting for the host's window
       wl_subsurface_set_desync(p->subsurface);
@@ -2218,13 +2277,13 @@ namespace {
       return places.back().get();
    }
 
-   void Impl::setParentOrigin(int32_t x, int32_t y) {
-      if (x == parentOriginX && y == parentOriginY)
+   void Impl::setParentOrigin(HostWindow &w, int32_t x, int32_t y) {
+      if (x == w.originX && y == w.originY)
          return;
-      parentOriginX = x;
-      parentOriginY = y;
+      w.originX = x;
+      w.originY = y;
       for (auto &p : places)
-         if (p->mirror.shown)
+         if (p->window == &w && p->mirror.shown)
             sendPosition(*p->mirror.shown);
    }
 
@@ -2286,6 +2345,7 @@ namespace {
          destroyMirror(p->mirror);
       }
       places.clear();
+      windows.clear();
 
       if (cursorShapeDevice)
          wp_cursor_shape_device_v1_destroy(cursorShapeDevice);
@@ -2320,7 +2380,7 @@ NestedCompositor::~NestedCompositor() { stop(); }
 
 bool NestedCompositor::start(const Upstream &upstream) {
    auto &impl = *_impl;
-   if (!upstream.display || !upstream.parent || !upstream.compositor || !upstream.subcompositor || !upstream.shm) {
+   if (!upstream.display || !upstream.compositor || !upstream.subcompositor || !upstream.shm) {
       std::cerr << "nested compositor: the system compositor lacks wl_subcompositor or wl_shm\n";
       return false;
    }
@@ -2406,19 +2466,53 @@ int NestedCompositor::openConnection() {
    return fds[1];
 }
 
-std::string NestedCompositor::createPlace(int32_t x, int32_t y) {
+NestedCompositor::WindowId NestedCompositor::addWindow(const Window &window) {
+   auto &impl = *_impl;
+   if (!impl.thread.joinable())
+      return UINT32_MAX; // which designates none
+
+   std::promise<WindowId> id;
+   impl.post([&] {
+      impl.windows.push_back(std::make_unique<HostWindow>(HostWindow{.up = window}));
+      id.set_value(WindowId(impl.windows.size() - 1));
+   });
+   return id.get_future().get();
+}
+
+void NestedCompositor::removeWindow(WindowId window) {
+   auto &impl = *_impl;
+   if (!impl.thread.joinable())
+      return;
+
+   // Synchronously: the host destroys the window's surface next, our places' parent
+   std::promise<void> done;
+   impl.post([&] {
+      if (window < impl.windows.size())
+         impl.removeWindow(*impl.windows[window]);
+      done.set_value();
+   });
+   done.get_future().get();
+}
+
+std::string NestedCompositor::createPlace(WindowId window, int32_t x, int32_t y) {
    auto &impl = *_impl;
    if (!impl.thread.joinable())
       return {};
 
    // On our thread, so that no event of the new objects is dispatched before it has a listener
    std::promise<std::string> token;
-   impl.post([&] { token.set_value(impl.createPlace(x, y)->token); });
+   impl.post([&] {
+      Place *p = window < impl.windows.size() ? impl.createPlace(*impl.windows[window], x, y) : nullptr;
+      token.set_value(p ? p->token : std::string());
+   });
    return token.get_future().get();
 }
 
-void NestedCompositor::setParentOrigin(int32_t x, int32_t y) {
+void NestedCompositor::setParentOrigin(WindowId window, int32_t x, int32_t y) {
    auto &impl = *_impl;
    if (impl.thread.joinable())
-      impl.post([&impl, x, y] { impl.setParentOrigin(x, y); });
+      impl.post([&impl, window, x, y] {
+         if (window < impl.windows.size())
+            impl.setParentOrigin(*impl.windows[window], x, y);
+      });
 }

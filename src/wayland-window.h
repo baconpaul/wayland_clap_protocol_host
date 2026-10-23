@@ -1,9 +1,10 @@
 #pragma once
 
-// The host's own toplevel window on the system Wayland compositor: a strip of "host UI" at the
-// top, and the area below it where the plugin's GUI is embedded through the nested compositor.
+// The host's own toplevel windows on the system Wayland compositor: a strip of "host UI" at the
+// top, and the area below it where a plugin's GUI is embedded through the nested compositor.
 //
-// libdecor decorates it: with the compositor's title bar where there is xdg-decoration, and
+// All the windows share one connection, which the nested compositor forwards the plugins to.
+// libdecor decorates them: with the compositor's title bar where there is xdg-decoration, and
 // otherwise (GNOME) with one it draws itself.
 
 #include <cstdint>
@@ -22,48 +23,38 @@ struct wl_registry;
 struct wp_cursor_shape_device_v1;
 struct xdg_wm_base;
 
-class WaylandWindow {
+class WaylandWindow;
+
+// The connection to the system compositor, and its globals
+class WaylandConnection {
 public:
-   static constexpr uint32_t kBarHeight = 32;
+   WaylandConnection() = default;
+   ~WaylandConnection();
 
-   WaylandWindow() = default;
-   ~WaylandWindow();
+   WaylandConnection(const WaylandConnection &) = delete;
+   WaylandConnection &operator=(const WaylandConnection &) = delete;
 
-   WaylandWindow(const WaylandWindow &) = delete;
-   WaylandWindow &operator=(const WaylandWindow &) = delete;
+   [[nodiscard]] bool open();
 
-   // The size is the embedded area's, the window adds the bar on top
-   [[nodiscard]] bool open(const char *title, uint32_t width, uint32_t height);
-   void resize(uint32_t width, uint32_t height);
-
-   // What the nested compositor needs to put the plugin's surface into our window
+   // What the nested compositor needs to forward the plugins' surfaces
    NestedCompositor::Upstream upstream() const;
 
-   // Where our content's (0, 0) is in the window's geometry: below libdecor's title bar
-   void contentOrigin(int32_t &x, int32_t &y) const;
-
-   // Applies the pending state of our surface, for example a subsurface's position
-   void commit();
-
    // Reads and dispatches our connection's events, waiting up to timeoutMs (-1: forever).
-   // extraFds are polled too, so that the plugin's posix fds wake us up; their revents are set.
+   // extraFds are polled too, so that the plugins' posix fds wake us up; their revents are set.
    void dispatch(int timeoutMs, std::vector<pollfd> &extraFds);
 
-   bool isOpen() const { return _isOpen; }
+   bool isConnected() const { return _isConnected; }
 
 private:
-   static WaylandWindow &self(void *data) { return *static_cast<WaylandWindow *>(data); }
+   friend class WaylandWindow;
+
+   static WaylandConnection &self(void *data) { return *static_cast<WaylandConnection *>(data); }
 
    void onGlobal(wl_registry *registry, uint32_t name, const char *interface, uint32_t version);
    void onSeatCapabilities(uint32_t capabilities);
-   void onConfigure(libdecor_frame *frame, libdecor_configuration *configuration);
-   void commitFrame(libdecor_configuration *configuration);
-   void redraw();
+   bool isOurs(wl_surface *surface) const;
 
-   bool _isOpen = false;
-   bool _isConfigured = false;
-   uint32_t _width = 0;
-   uint32_t _height = 0;
+   bool _isConnected = false;
 
    wl_display *_display = nullptr;
    wl_registry *_registry = nullptr;
@@ -81,8 +72,59 @@ private:
    wl_pointer *_pointer = nullptr;
    wp_cursor_shape_device_v1 *_cursorShapeDevice = nullptr;
 
-   wl_surface *_surface = nullptr;
    libdecor *_decor = nullptr;
+   std::vector<WaylandWindow *> _windows;
+};
+
+class WaylandWindow {
+public:
+   static constexpr uint32_t kBarHeight = 32;
+
+   struct Colors {
+      uint32_t bar;
+      uint32_t accent; // the line below the bar
+      uint32_t text;
+   };
+
+   WaylandWindow(WaylandConnection &connection, const Colors &colors);
+   ~WaylandWindow();
+
+   WaylandWindow(const WaylandWindow &) = delete;
+   WaylandWindow &operator=(const WaylandWindow &) = delete;
+
+   // The size is the embedded area's, the window adds the bar on top
+   [[nodiscard]] bool open(const char *title, uint32_t width, uint32_t height);
+   void resize(uint32_t width, uint32_t height);
+
+   // What the nested compositor needs to put a plugin's surface into this window
+   NestedCompositor::Window nested() const;
+
+   // Where our content's (0, 0) is in the window's geometry: below libdecor's title bar
+   void contentOrigin(int32_t &x, int32_t &y) const;
+
+   // Applies the pending state of our surface, for example a subsurface's position
+   void commit();
+
+   bool isOpen() const { return _isOpen && _connection.isConnected(); }
+
+private:
+   friend class WaylandConnection;
+
+   static WaylandWindow &self(void *data) { return *static_cast<WaylandWindow *>(data); }
+
+   void onConfigure(libdecor_frame *frame, libdecor_configuration *configuration);
+   void commitFrame(libdecor_configuration *configuration);
+   void redraw();
+
+   WaylandConnection &_connection;
+   const Colors _colors;
+
+   bool _isOpen = false;
+   bool _isConfigured = false;
+   uint32_t _width = 0;
+   uint32_t _height = 0;
+
+   wl_surface *_surface = nullptr;
    libdecor_frame *_frame = nullptr;
    wl_buffer *_buffer = nullptr;
 };
