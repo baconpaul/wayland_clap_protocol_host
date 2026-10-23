@@ -171,11 +171,13 @@ The plugin is never activated.
 - **No clipboard or drag and drop.** The `wl_output` is a placeholder (1920x1080, scale 1) which
   no surface enters.
 - **Only one plugin** at a time. Closing and reopening the GUI is untested.
-- **GPU buffers are untested.** They were written on a VM without 3D acceleration, whose
-  compositor offers linux-dmabuf v3 only, which isn't forwarded. There, GL plugins (`sdl3-demo`)
-  fall back to Mesa's software rendering into `wl_shm`. Also missing:
+- **GPU buffers are tested on AMD only.** On an AMD Renoir (radeonsi) under GNOME, `sdl3-demo`
+  renders into tiled dmabufs which are forwarded and released as they should be. A system
+  compositor which offers linux-dmabuf v3 only (as on a VM without 3D acceleration) isn't
+  forwarded, and GL plugins then fall back to Mesa's software rendering into `wl_shm`. Also
+  missing:
   - plugins which only know linux-dmabuf v3, which get no `format`/`modifier` events
-  - explicit sync (`wp_linux_drm_syncobj_v1`)
+  - explicit sync (`wp_linux_drm_syncobj_v1`), which NVIDIA's driver relies on
 - **Bad dmabufs:** a plugin which ignores the feedback and submits a format that the system
   compositor never advertised gets the *host's* connection killed. The compositor can't check
   that itself.
