@@ -1,0 +1,1234 @@
+diff --git a/include/meson.build b/include/meson.build
+index 3d838ca..6f9c0c0 100644
+--- a/include/meson.build
++++ b/include/meson.build
+@@ -9,6 +9,7 @@ c_headers = files(
+   'pugl/pugl.h',
+   'pugl/stub.h',
+   'pugl/vulkan.h',
++  'pugl/wayland.h',
+ )
+ 
+ install_headers(c_headers, subdir: versioned_name / 'pugl')
+diff --git a/include/pugl/wayland.h b/include/pugl/wayland.h
+new file mode 100644
+index 0000000..796a4b3
+--- /dev/null
++++ b/include/pugl/wayland.h
+@@ -0,0 +1,63 @@
++// Copyright 2026 David Robillard <d@drobilla.net>
++// SPDX-License-Identifier: ISC
++
++#ifndef PUGL_WAYLAND_H
++#define PUGL_WAYLAND_H
++
++#include <pugl/attributes.h>
++#include <pugl/pugl.h>
++
++struct wl_display;
++
++PUGL_BEGIN_DECLS
++
++/**
++   @defgroup pugl_wayland Wayland
++   Wayland-specific functions.
++   @ingroup pugl
++   @{
++*/
++
++/**
++   Create a new world on an existing Wayland connection.
++
++   This is for plugins, whose host gives them the connection to use, for
++   example its own nested compositor.  The world doesn't own the connection:
++   the caller disconnects it after freeing the world.
++
++   @param type The type, which dictates what this world is responsible for.
++   @param flags Flags to control world features.
++   @param display The connection, which must outlive the world.
++   @return A new world, which must be later freed with puglFreeWorld().
++*/
++PUGL_MALLOC_API PuglWorld*
++puglNewWaylandWorld(PuglWorldType      type,
++                    PuglWorldFlags     flags,
++                    struct wl_display* display);
++
++/**
++   Embed a view into a surface of the host, with the clap_surface_embedding_v1
++   protocol (https://github.com/free-audio/clap-wayland-experiment).
++
++   This replaces puglSetParent(), since Wayland has no global window handles:
++   the host gives a token instead, which names a place in its window.  It must
++   be called before the view is realized.
++
++   An embedded view has a size in logical pixels, which is its default size,
++   and draws at the scale of the compositor: its configured size is the
++   logical one times puglGetScaleFactor().  When the scale changes, the view
++   gets a new configuration.
++
++   @return #PUGL_BAD_CALL if the view is already realized.  If the compositor
++   can't embed, puglRealize() fails with #PUGL_UNSUPPORTED.
++*/
++PUGL_API PuglStatus
++puglSetWaylandEmbeddingToken(PuglView* view, const char* token);
++
++/**
++   @}
++*/
++
++PUGL_END_DECLS
++
++#endif // PUGL_WAYLAND_H
+diff --git a/meson.build b/meson.build
+index 8115c8f..2b43a1a 100644
+--- a/meson.build
++++ b/meson.build
+@@ -162,6 +162,7 @@ dl_dep = cc.find_library('dl', required: false)
+ m_dep = cc.find_library('m', required: false)
+ 
+ platform_link_args = []
++platform_includes = []
+ gl_backend_deps = []
+ 
+ if host_machine.system() == 'darwin'
+@@ -286,14 +287,48 @@ else
+   egl_dep = dependency('egl', required: false)
+   wayland_egl_dep = dependency('wayland-egl', required: false)
+ 
++  wayland_protocols_dep = dependency(
++    'wayland-protocols',
++    required: get_option('wayland'),
++  )
++
++  wayland_scanner = find_program(
++    'wayland-scanner',
++    native: true,
++    required: get_option('wayland'),
++  )
++
+   if (
+     wayland_client_dep.found()
+     and wayland_cursor_dep.found()
++    and wayland_protocols_dep.found()
++    and wayland_scanner.found()
+     and xkbcommon_dep.found()
+   )
+     # Wayland
+     platform = 'wayland'
+     platform_sources = files('src/wayland.c', 'src/xdg-shell.c')
++
++    # Protocols for embedding into a host's window, and for scaling
++    protocols_dir = wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir')
++    protocol_xmls = [
++      files('protocols/clap-surface-embedding-v1.xml'),
++      protocols_dir / 'stable/viewporter/viewporter.xml',
++      protocols_dir / 'staging/fractional-scale/fractional-scale-v1.xml',
++    ]
++    foreach xml : protocol_xmls
++      platform_sources += custom_target(
++        input: xml,
++        output: '@BASENAME@-client-protocol.h',
++        command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
++      )
++      platform_sources += custom_target(
++        input: xml,
++        output: '@BASENAME@-protocol.c',
++        command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
++      )
++    endforeach
++    platform_includes = include_directories('.') # the generated headers
+     core_deps = [wayland_client_dep, wayland_cursor_dep, xkbcommon_dep]
+     gl_backend_deps += [egl_dep, wayland_egl_dep]
+     platform_args += [
+@@ -374,7 +409,7 @@ libpugl = library(
+   dependencies: core_deps,
+   gnu_symbol_visibility: 'hidden',
+   implicit_include_directories: false,
+-  include_directories: includes,
++  include_directories: [includes, platform_includes],
+   install: install,
+   link_args: platform_link_args,
+   objc_args: objc_suppressions + library_args,
+diff --git a/protocols/clap-surface-embedding-v1.xml b/protocols/clap-surface-embedding-v1.xml
+new file mode 100644
+index 0000000..5bd5979
+--- /dev/null
++++ b/protocols/clap-surface-embedding-v1.xml
+@@ -0,0 +1,176 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="clap_surface_embedding_v1">
++  <copyright>
++    Copyright (c) 2026 free-audio
++
++    Permission is hereby granted, free of charge, to any person obtaining a
++    copy of this software and associated documentation files (the "Software"),
++    to deal in the Software without restriction, including without limitation
++    the rights to use, copy, modify, merge, publish, distribute, sublicense,
++    and/or sell copies of the Software, and to permit persons to whom the
++    Software is furnished to do so, subject to the following conditions:
++
++    The above copyright notice and this permission notice (including the next
++    paragraph) shall be included in all copies or substantial portions of the
++    Software.
++
++    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++    DEALINGS IN THE SOFTWARE.
++  </copyright>
++
++  <description summary="embed a client's surface into a window of the host application">
++    This protocol lets a client embed its surface into a window of a host
++    application, which runs the compositor that the client is connected to.
++
++    For example, an audio application runs a Wayland compositor of its own,
++    which forwards the requests of its clients to the system compositor, and
++    its plugins embed their user interfaces into its windows. See the
++    clap_plugin_gui_wayland_nested_compositor extension in
++    include/clap/ext/draft/wayland-experiment.h.
++
++    The host application gives an embedding token to the client by other means
++    than this protocol, for example with the CLAP plugin API. The client
++    creates a wl_surface, and embeds it with get_embedded_surface and the
++    token.
++
++    This protocol is experimental. It is based on the ext_surface_embedding_v1
++    draft by jwolffpsl:
++    https://github.com/free-audio/clap/issues/474#issuecomment-4177525720
++  </description>
++
++  <interface name="clap_surface_embedding_v1" version="1">
++    <description summary="embed surfaces into windows of the host application">
++      The compositor of the host application exposes this global.
++    </description>
++
++    <enum name="error">
++      <entry name="role" value="0"
++             summary="the wl_surface already has another role"/>
++      <entry name="already_embedded" value="1"
++             summary="the wl_surface already has a clap_embedded_surface_v1 object"/>
++    </enum>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the clap_surface_embedding_v1 object">
++        Destroys this object. The embedded surfaces which it created remain.
++      </description>
++    </request>
++
++    <request name="get_embedded_surface">
++      <description summary="embed a surface">
++        Gives the wl_surface the embedded surface role, and embeds it at the
++        place which the token designates.
++
++        The token is an opaque string, which the host application gave to the
++        client by other means. If the compositor doesn't know the token, if
++        another embedded surface already uses it, or if the compositor refuses
++        the embedding for any other reason, it sends the closed event to the new
++        object. Any client of the compositor could present a token, so the host
++        application should make its tokens hard to guess.
++
++        It is a protocol error to give a wl_surface which already has another
++        role, or which already has a clap_embedded_surface_v1 object. After its
++        clap_embedded_surface_v1 object is destroyed, the wl_surface may be
++        embedded again.
++      </description>
++      <arg name="id" type="new_id" interface="clap_embedded_surface_v1"/>
++      <arg name="surface" type="object" interface="wl_surface"/>
++      <arg name="token" type="string" summary="embedding token from the host application"/>
++    </request>
++  </interface>
++
++  <interface name="clap_embedded_surface_v1" version="1">
++    <description summary="a surface embedded into a window of the host application">
++      An embedded surface appears inside a window of the host application, at
++      the place which the host application chose. The compositor positions it;
++      the client can't.
++
++      The surface is mapped when a buffer is attached and committed, and
++      unmapped when a null buffer is committed. Its size is the size of its
++      buffer, or of its viewport, and the host application and the client agree
++      on it by other means than this protocol, for example with the CLAP plugin
++      API. The compositor may clip the surface to the area which the host
++      application reserved for it.
++
++      The compositor applies the surface's commits as soon as possible, as for a
++      desynchronized wl_subsurface. It may synchronize them with the host
++      application's own commits, for example while the area is resized, so that
++      both appear at once.
++
++      The surface receives input events like any other surface. The compositor
++      gives it the keyboard focus as it sees fit, for example when the user
++      clicks into it.
++
++      For its popups, like menus and tooltips, and for its dialogs, the client
++      uses the standard protocols on the same connection, with the parents
++      which get_parent_surface and get_parent_toplevel give.
++
++      If the wl_surface is destroyed, this object becomes inert: the compositor
++      ignores its requests, and the client should destroy it.
++    </description>
++
++    <request name="destroy" type="destructor">
++      <description summary="stop embedding the surface">
++        Unmaps the surface, and destroys this object.
++      </description>
++    </request>
++
++    <request name="get_parent_surface">
++      <description summary="get the parent surface, for popups">
++        Creates an xdg_surface object which refers to the host application's
++        surface containing the embedded surface: the closest xdg_surface, a
++        toplevel or a popup, among the embedded surface's ancestors. The client
++        uses it as the parent of its popups, with xdg_surface.get_popup, and
++        places them with the position event.
++
++        The new object only stands for the host application's surface. The
++        compositor ignores all its requests except destroy, and sends no event
++        on it. The client destroys it when it doesn't need it anymore.
++      </description>
++      <arg name="id" type="new_id" interface="xdg_surface"/>
++    </request>
++
++    <request name="get_parent_toplevel">
++      <description summary="get the parent toplevel, for dialogs">
++        Creates an xdg_toplevel object which refers to the host application's
++        toplevel containing the embedded surface. The client uses it as the
++        parent of its own toplevels, for example its dialogs, with
++        xdg_toplevel.set_parent.
++
++        The new object only stands for the host application's toplevel. The
++        compositor ignores all its requests except destroy, and sends no event
++        on it. The client destroys it when it doesn't need it anymore.
++      </description>
++      <arg name="id" type="new_id" interface="xdg_toplevel"/>
++    </request>
++
++    <event name="position">
++      <description summary="position in the parent surface">
++        The position of the embedded surface's top left corner, relative to the
++        window geometry of the parent surface (see get_parent_surface), in the
++        parent's surface-local coordinates. The client needs it to place its
++        popups with xdg_positioner.
++
++        The compositor sends it right after get_embedded_surface, unless it
++        sends closed, and whenever the position changes.
++      </description>
++      <arg name="x" type="int"/>
++      <arg name="y" type="int"/>
++    </event>
++
++    <event name="closed">
++      <description summary="the embedding ended">
++        The compositor ended the embedding, or refused it: for example the
++        token was unknown or already in use, or the host application removed
++        the place which the token designated. The surface is unmapped, the
++        compositor ignores the requests on this object, and the client should
++        destroy it.
++      </description>
++    </event>
++  </interface>
++</protocol>
+diff --git a/src/wayland.c b/src/wayland.c
+index 67d8335..bbd7a86 100644
+--- a/src/wayland.c
++++ b/src/wayland.c
+@@ -9,7 +9,13 @@
+ #include "types.h"
+ #include "xdg-shell.h"
+ 
++// Generated by wayland-scanner, after xdg-shell.h which the embedding uses
++#include "clap-surface-embedding-v1-client-protocol.h"
++#include "fractional-scale-v1-client-protocol.h"
++#include "viewporter-client-protocol.h"
++
+ #include <pugl/pugl.h>
++#include <pugl/wayland.h>
+ 
+ #include <wayland-client-core.h>
+ #include <wayland-client-protocol.h>
+@@ -50,6 +56,15 @@ findView(PuglWorld* const world, const struct wl_surface* const wlSurface)
+   return NULL;
+ }
+ 
++// Converts surface coordinates to view coordinates, which are an embedded
++// view's buffer pixels
++static double
++toViewCoordinate(const PuglView* const view, const wl_fixed_t value)
++{
++  const double scale = view->impl->embeddedSurface ? view->impl->scale : 1.0;
++  return wl_fixed_to_double(value) * scale;
++}
++
+ // WM Base
+ 
+ static void
+@@ -81,19 +96,22 @@ onPointerEnter(void* const              data,
+   }
+ 
+   assert(!world->impl->enteredView);
+-  world->impl->enteredView = view;
+-  view->impl->pointerX     = surfaceX;
+-  view->impl->pointerY     = surfaceY;
+-
+-  wl_pointer_set_cursor(pointer,
+-                        serial,
+-                        view->impl->cursorSurface,
+-                        (int32_t)view->impl->cursorImage->hotspot_x,
+-                        (int32_t)view->impl->cursorImage->hotspot_y);
++  world->impl->enteredView       = view;
++  world->impl->lastPointerSerial = serial;
++  view->impl->pointerX           = surfaceX;
++  view->impl->pointerY           = surfaceY;
++
++  if (view->impl->cursorImage) {
++    wl_pointer_set_cursor(pointer,
++                          serial,
++                          view->impl->cursorSurface,
++                          (int32_t)view->impl->cursorImage->hotspot_x,
++                          (int32_t)view->impl->cursorImage->hotspot_y);
++  }
+ 
+   PuglEvent event     = {{PUGL_POINTER_IN, 0}};
+-  event.crossing.x    = wl_fixed_to_double(surfaceX);
+-  event.crossing.y    = wl_fixed_to_double(surfaceY);
++  event.crossing.x    = toViewCoordinate(view, surfaceX);
++  event.crossing.y    = toViewCoordinate(view, surfaceY);
+   event.crossing.mode = PUGL_CROSSING_NORMAL;
+   puglDispatchEvent(view, &event);
+ }
+@@ -115,8 +133,8 @@ onPointerLeave(void* const              data,
+   world->impl->enteredView = NULL;
+ 
+   PuglEvent event     = {{PUGL_POINTER_OUT, 0}};
+-  event.crossing.x    = wl_fixed_to_double(view->impl->pointerX);
+-  event.crossing.y    = wl_fixed_to_double(view->impl->pointerY);
++  event.crossing.x    = toViewCoordinate(view, view->impl->pointerX);
++  event.crossing.y    = toViewCoordinate(view, view->impl->pointerY);
+   event.crossing.mode = PUGL_CROSSING_NORMAL;
+   puglDispatchEvent(view, &event);
+ }
+@@ -139,8 +157,8 @@ onPointerMotion(void* const              data,
+ 
+   PuglEvent event    = {{PUGL_MOTION, 0}};
+   event.motion.time  = (double)time / 1e3;
+-  event.motion.x     = wl_fixed_to_double(view->impl->pointerX);
+-  event.motion.y     = wl_fixed_to_double(view->impl->pointerY);
++  event.motion.x     = toViewCoordinate(view, view->impl->pointerX);
++  event.motion.y     = toViewCoordinate(view, view->impl->pointerY);
+   event.motion.state = world->impl->depressedMods;
+   puglDispatchEvent(view, &event);
+ }
+@@ -165,8 +183,8 @@ onPointerButton(void* const              data,
+                       0}};
+ 
+   event.button.time   = (double)time / 1e3;
+-  event.button.x      = wl_fixed_to_double(view->impl->pointerX);
+-  event.button.y      = wl_fixed_to_double(view->impl->pointerY);
++  event.button.x      = toViewCoordinate(view, view->impl->pointerX);
++  event.button.y      = toViewCoordinate(view, view->impl->pointerY);
+   event.button.state  = world->impl->depressedMods;
+   event.button.button = button - BTN_LEFT;
+   puglDispatchEvent(view, &event);
+@@ -187,8 +205,8 @@ onPointerAxis(void* const              data,
+ 
+   PuglEvent event    = {{PUGL_SCROLL, 0}};
+   event.scroll.time  = (double)time / 1e3;
+-  event.scroll.x     = wl_fixed_to_double(view->impl->pointerX);
+-  event.scroll.y     = wl_fixed_to_double(view->impl->pointerY);
++  event.scroll.x     = toViewCoordinate(view, view->impl->pointerX);
++  event.scroll.y     = toViewCoordinate(view, view->impl->pointerY);
+   event.scroll.state = world->impl->depressedMods;
+ 
+   if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
+@@ -604,8 +622,21 @@ registry_global(void* const               data,
+     impl->shm =
+       (struct wl_shm*)wl_registry_bind(registry, name, &wl_shm_interface, 1);
+   } else if (strcmp(interface, wl_compositor_interface.name) == 0) {
+-    impl->compositor = (struct wl_compositor*)wl_registry_bind(
+-      registry, name, &wl_compositor_interface, 4);
++    // Version 6 for the surfaces' preferred_buffer_scale
++    impl->compositorVersion = version < 6U ? version : 6U;
++    impl->compositor        = (struct wl_compositor*)wl_registry_bind(
++      registry, name, &wl_compositor_interface, impl->compositorVersion);
++  } else if (strcmp(interface, clap_surface_embedding_v1_interface.name) == 0) {
++    impl->embedding = (struct clap_surface_embedding_v1*)wl_registry_bind(
++      registry, name, &clap_surface_embedding_v1_interface, 1);
++  } else if (strcmp(interface, wp_viewporter_interface.name) == 0) {
++    impl->viewporter = (struct wp_viewporter*)wl_registry_bind(
++      registry, name, &wp_viewporter_interface, 1);
++  } else if (strcmp(interface,
++                    wp_fractional_scale_manager_v1_interface.name) == 0) {
++    impl->fractionalScaleManager =
++      (struct wp_fractional_scale_manager_v1*)wl_registry_bind(
++        registry, name, &wp_fractional_scale_manager_v1_interface, 1);
+   } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
+     impl->wmBase = (struct xdg_wm_base*)wl_registry_bind(
+       registry, name, &xdg_wm_base_interface, 1);
+@@ -642,19 +673,32 @@ static const struct wl_registry_listener wl_registry_listener = {
+ 
+ // Toplevel
+ 
++static PuglArea
++getEmbeddedSize(const PuglView* const view)
++{
++  const PuglInternals* const impl = view->impl;
++  const PuglArea             size = {
++    (PuglSpan)((impl->logicalSize.width * impl->scale) + 0.5),
++    (PuglSpan)((impl->logicalSize.height * impl->scale) + 0.5),
++  };
++  return size;
++}
++
+ static PuglEvent
+ getCurrentConfiguration(const PuglView* const view)
+ {
+   PuglEvent       event = {{PUGL_CONFIGURE, 0U}};
+   const PuglPoint pos   = puglGetPositionHint(view, PUGL_CURRENT_POSITION);
+-  const PuglArea  size  = puglGetSizeHint(view, PUGL_CURRENT_SIZE);
++  const PuglArea  size  = view->impl->embeddedSurface
++                            ? getEmbeddedSize(view)
++                            : puglGetSizeHint(view, PUGL_CURRENT_SIZE);
+ 
+   event.configure.x      = pos.x;
+   event.configure.y      = pos.y;
+   event.configure.width  = size.width;
+   event.configure.height = size.height;
+   event.configure.style  = view->lastConfigure.style;
+-  if (view->impl->toplevel) {
++  if (view->impl->toplevel || view->impl->embeddedShown) {
+     event.configure.style |= PUGL_VIEW_STYLE_MAPPED;
+   } else {
+     event.configure.style &= ~(PuglViewStyleFlags)PUGL_VIEW_STYLE_MAPPED;
+@@ -783,6 +827,31 @@ static const struct wl_callback_listener wl_surface_frame_listener = {
+   onSurfaceFrameDone,
+ };
+ 
++static bool
++isShown(const PuglView* const view)
++{
++  return view->impl->toplevel || view->impl->embeddedShown;
++}
++
++// Draws now, and asks for a frame callback to draw the next frame
++static void
++exposeNow(PuglView* const view)
++{
++  PuglInternals* const impl = view->impl;
++
++  impl->exposePending = false;
++  if (!impl->frameCallback) {
++    impl->frameCallback = wl_surface_frame(impl->wlSurface);
++    wl_callback_add_listener(
++      impl->frameCallback, &wl_surface_frame_listener, view);
++  }
++
++  PuglEvent event     = {{PUGL_EXPOSE, 0U}};
++  event.expose.width  = view->lastConfigure.width;
++  event.expose.height = view->lastConfigure.height;
++  puglDispatchEvent(view, &event);
++}
++
+ static void
+ onSurfaceFrameDone(void* const         data,
+                    struct wl_callback* cb,
+@@ -790,44 +859,235 @@ onSurfaceFrameDone(void* const         data,
+ {
+   PuglView* const view = (PuglView*)data;
+ 
+-  // Destroy this callback and request another frame
+   wl_callback_destroy(cb);
+-  cb = wl_surface_frame(view->impl->wlSurface);
+-  wl_callback_add_listener(cb, &wl_surface_frame_listener, view);
++  view->impl->frameCallback = NULL;
+ 
+-  PuglEvent event     = {{PUGL_EXPOSE, 0U}};
+-  event.expose.width  = view->lastConfigure.width;
+-  event.expose.height = view->lastConfigure.height;
+-  puglDispatchEvent(view, &event);
++  if (isShown(view) &&
++      (view->hints[PUGL_CONTINUOUS] || view->impl->exposePending)) {
++    exposeNow(view);
++  }
+ }
+ 
+-// World
++static void
++cancelFrame(PuglView* const view)
++{
++  if (view->impl->frameCallback) {
++    wl_callback_destroy(view->impl->frameCallback);
++    view->impl->frameCallback = NULL;
++  }
++}
+ 
+-PuglWorldInternals*
+-puglInitWorldInternals(PuglWorld* const     world,
+-                       const PuglWorldType  PUGL_UNUSED(type),
+-                       const PuglWorldFlags PUGL_UNUSED(flags))
++// Embedding
++
++static void
++updateViewport(PuglView* const view)
+ {
+-  struct wl_display* display = wl_display_connect(NULL);
+-  if (!display) {
+-    return NULL;
++  PuglInternals* const impl = view->impl;
++
++  // The buffers have the native size, which the compositor scales down
++  if (impl->viewport) {
++    wp_viewport_set_destination(impl->viewport,
++                                (int32_t)impl->logicalSize.width,
++                                (int32_t)impl->logicalSize.height);
++  } else {
++    const int32_t scale = (int32_t)(impl->scale + 0.5);
++    wl_surface_set_buffer_scale(impl->wlSurface, scale > 1 ? scale : 1);
++  }
++}
++
++static void
++setEmbeddedScale(PuglView* const view, const double scale)
++{
++  PuglInternals* const impl = view->impl;
++  if (scale <= 0.0 || scale == impl->scale) {
++    return;
++  }
++
++  impl->scale = scale;
++  updateViewport(view);
++
++  // Configured views are configured again, at the new size
++  if (view->stage == PUGL_VIEW_STAGE_CONFIGURED) {
++    const PuglEvent event = getCurrentConfiguration(view);
++    puglDispatchEvent(view, &event);
++    impl->exposePending = true;
++    if (impl->embeddedShown && !impl->frameCallback) {
++      exposeNow(view);
++    }
++  }
++}
++
++static void
++onSurfaceEnter(void* const              PUGL_UNUSED(data),
++               struct wl_surface* const PUGL_UNUSED(surface),
++               struct wl_output* const  PUGL_UNUSED(output))
++{}
++
++static void
++onSurfaceLeave(void* const              PUGL_UNUSED(data),
++               struct wl_surface* const PUGL_UNUSED(surface),
++               struct wl_output* const  PUGL_UNUSED(output))
++{}
++
++static void
++onSurfacePreferredBufferScale(void* const              data,
++                              struct wl_surface* const PUGL_UNUSED(surface),
++                              const int32_t            factor)
++{
++  // Until a fractional scale comes, if ever
++  PuglView* const view = (PuglView*)data;
++  if (view->impl->embeddedSurface && !view->impl->hasFractionalScale) {
++    setEmbeddedScale(view, factor);
++  }
++}
++
++static void
++onSurfacePreferredBufferTransform(void* const              PUGL_UNUSED(data),
++                                  struct wl_surface* const PUGL_UNUSED(surface),
++                                  const uint32_t PUGL_UNUSED(transform))
++{}
++
++static const struct wl_surface_listener wl_surface_listener = {
++  onSurfaceEnter,
++  onSurfaceLeave,
++  onSurfacePreferredBufferScale,
++  onSurfacePreferredBufferTransform,
++};
++
++static void
++onFractionalScalePreferredScale(
++  void* const                           data,
++  struct wp_fractional_scale_v1* const PUGL_UNUSED(fractionalScale),
++  const uint32_t                        scale120)
++{
++  PuglView* const view           = (PuglView*)data;
++  view->impl->hasFractionalScale = true;
++  setEmbeddedScale(view, scale120 / 120.0);
++}
++
++static const struct wp_fractional_scale_v1_listener
++  wp_fractional_scale_listener = {
++    onFractionalScalePreferredScale,
++};
++
++static void
++onEmbeddedSurfacePosition(
++  void* const                             PUGL_UNUSED(data),
++  struct clap_embedded_surface_v1* const PUGL_UNUSED(embeddedSurface),
++  const int32_t                           PUGL_UNUSED(x),
++  const int32_t                           PUGL_UNUSED(y))
++{}
++
++static void
++onEmbeddedSurfaceClosed(
++  void* const                             data,
++  struct clap_embedded_surface_v1* const PUGL_UNUSED(embeddedSurface))
++{
++  // The host ended the embedding: the view stays, but can't be shown again
++  PuglView* const view = (PuglView*)data;
++  puglHide(view);
++  clap_embedded_surface_v1_destroy(view->impl->embeddedSurface);
++  view->impl->embeddedSurface = NULL;
++  puglDispatchSimpleEvent(view, PUGL_CLOSE);
++}
++
++static const struct clap_embedded_surface_v1_listener
++  clap_embedded_surface_listener = {
++    onEmbeddedSurfacePosition,
++    onEmbeddedSurfaceClosed,
++};
++
++// Creates the embedding of a realized view, and waits for the compositor to
++// tell its scale, or to refuse the embedding
++static PuglStatus
++embed(PuglView* const view)
++{
++  PuglWorldInternals* const world = view->world->impl;
++  PuglInternals* const      impl  = view->impl;
++
++  if (!world->embedding) {
++    return PUGL_UNSUPPORTED;
++  }
++
++  impl->scale       = 1.0;
++  impl->logicalSize = view->sizeHints[PUGL_DEFAULT_SIZE];
++  if (world->viewporter) {
++    impl->viewport = wp_viewporter_get_viewport(world->viewporter, impl->wlSurface);
++    if (world->fractionalScaleManager) {
++      impl->fractionalScale = wp_fractional_scale_manager_v1_get_fractional_scale(
++        world->fractionalScaleManager, impl->wlSurface);
++      wp_fractional_scale_v1_add_listener(
++        impl->fractionalScale, &wp_fractional_scale_listener, view);
++    }
++  }
++
++  impl->embeddedSurface = clap_surface_embedding_v1_get_embedded_surface(
++    world->embedding, impl->wlSurface, impl->embeddingToken);
++  clap_embedded_surface_v1_add_listener(
++    impl->embeddedSurface, &clap_embedded_surface_listener, view);
++
++  updateViewport(view);
++  if (wl_display_roundtrip(world->display) < 0) {
++    return PUGL_UNKNOWN_ERROR;
++  }
++
++  return impl->embeddedSurface ? PUGL_SUCCESS : PUGL_REALIZE_FAILED;
++}
++
++static void
++unembed(PuglView* const view)
++{
++  PuglInternals* const impl = view->impl;
++
++  if (impl->fractionalScale) {
++    wp_fractional_scale_v1_destroy(impl->fractionalScale);
++    impl->fractionalScale = NULL;
++  }
++  if (impl->viewport) {
++    wp_viewport_destroy(impl->viewport);
++    impl->viewport = NULL;
++  }
++  if (impl->embeddedSurface) {
++    clap_embedded_surface_v1_destroy(impl->embeddedSurface);
++    impl->embeddedSurface = NULL;
++  }
++  impl->hasFractionalScale = false;
++}
++
++PuglStatus
++puglSetWaylandEmbeddingToken(PuglView* const view, const char* const token)
++{
++  if (view->impl->wlSurface) {
++    return PUGL_BAD_CALL;
+   }
+ 
++  return puglSetString(&view->impl->embeddingToken, token);
++}
++
++// World
++
++static PuglWorldInternals*
++initWorldInternals(PuglWorld* const         world,
++                   struct wl_display* const display,
++                   const bool               ownsDisplay)
++{
+   PuglWorldInternals* impl =
+     (PuglWorldInternals*)calloc(1, sizeof(PuglWorldInternals));
+ 
+   world->impl       = impl;
+   impl->display     = display;
++  impl->ownsDisplay = ownsDisplay;
+   impl->xkbContext  = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+   impl->scaleFactor = 1;
+ 
+-  // Get the registry and our list of globals from it
++  // Get the registry and our list of globals from it.  A host's compositor
++  // may have no shell or seat, which only toplevels and input need.
+   impl->registry = wl_display_get_registry(display);
+   wl_registry_add_listener(impl->registry, &wl_registry_listener, world);
+-  if (wl_display_roundtrip(display) < 0 || !impl->compositor || !impl->wmBase ||
+-      !impl->seat) {
++  if (wl_display_roundtrip(display) < 0 || !impl->compositor ||
++      (ownsDisplay && (!impl->wmBase || !impl->seat))) {
++    puglFreeWorldInternals(world);
+     world->impl = NULL;
+-    free(impl);
+     return NULL;
+   }
+ 
+@@ -840,10 +1100,98 @@ puglInitWorldInternals(PuglWorld* const     world,
+   return impl;
+ }
+ 
++PuglWorldInternals*
++puglInitWorldInternals(PuglWorld* const     world,
++                       const PuglWorldType  PUGL_UNUSED(type),
++                       const PuglWorldFlags PUGL_UNUSED(flags))
++{
++  struct wl_display* const display = wl_display_connect(NULL);
++  if (!display) {
++    return NULL;
++  }
++
++  return initWorldInternals(world, display, true);
++}
++
++PuglWorld*
++puglNewWaylandWorld(const PuglWorldType      type,
++                    const PuglWorldFlags     PUGL_UNUSED(flags),
++                    struct wl_display* const display)
++{
++  PuglWorld* const world = (PuglWorld*)calloc(1, sizeof(PuglWorld));
++  if (!world || !display || !initWorldInternals(world, display, false) ||
++      puglSetString(&world->strings[PUGL_CLASS_NAME], "Pugl")) {
++    if (world && world->impl) {
++      puglFreeWorldInternals(world);
++    }
++    free(world);
++    return NULL;
++  }
++
++  world->startTime = puglGetTime(world);
++  world->type      = type;
++  return world;
++}
++
+ void
+ puglFreeWorldInternals(PuglWorld* const world)
+ {
+-  free(world->impl);
++  PuglWorldInternals* const impl = world->impl;
++
++  // Everything goes, since the display may stay connected
++  if (impl->cursorTheme) {
++    wl_cursor_theme_destroy(impl->cursorTheme);
++  }
++  if (impl->xkbState) {
++    xkb_state_unref(impl->xkbState);
++  }
++  if (impl->xkbKeymap) {
++    xkb_keymap_unref(impl->xkbKeymap);
++  }
++  if (impl->xkbContext) {
++    xkb_context_unref(impl->xkbContext);
++  }
++  if (impl->keyboard) {
++    wl_keyboard_release(impl->keyboard);
++  }
++  if (impl->pointer) {
++    wl_pointer_release(impl->pointer);
++  }
++  if (impl->seat) {
++    wl_seat_destroy(impl->seat);
++  }
++  if (impl->output) {
++    wl_output_destroy(impl->output);
++  }
++  if (impl->fractionalScaleManager) {
++    wp_fractional_scale_manager_v1_destroy(impl->fractionalScaleManager);
++  }
++  if (impl->viewporter) {
++    wp_viewporter_destroy(impl->viewporter);
++  }
++  if (impl->embedding) {
++    clap_surface_embedding_v1_destroy(impl->embedding);
++  }
++  if (impl->wmBase) {
++    xdg_wm_base_destroy(impl->wmBase);
++  }
++  if (impl->shm) {
++    wl_shm_destroy(impl->shm);
++  }
++  if (impl->compositor) {
++    wl_compositor_destroy(impl->compositor);
++  }
++  if (impl->registry) {
++    wl_registry_destroy(impl->registry);
++  }
++
++  if (impl->ownsDisplay) {
++    wl_display_disconnect(impl->display);
++  } else {
++    wl_display_flush(impl->display);
++  }
++
++  free(impl);
+ }
+ 
+ void*
+@@ -938,6 +1286,24 @@ puglUpdate(PuglWorld* const world, const double timeout)
+   // Finally read and dispatch events
+   wl_display_read_events(display);
+   wl_display_dispatch_pending(display);
++
++  // Draw the views which asked for it, unless a frame callback will
++  for (size_t i = 0; i < world->numViews; ++i) {
++    PuglView* const view = world->views[i];
++    if (view->impl->exposePending && !view->impl->frameCallback &&
++        isShown(view)) {
++      exposeNow(view);
++    }
++  }
++
++  // Leave nothing in the queue, since our fd won't wake us up for it, and
++  // send our requests
++  while (wl_display_prepare_read(display)) {
++    wl_display_dispatch_pending(display);
++  }
++  wl_display_cancel_read(display);
++  wl_display_flush(display);
++
+   world->state = startState;
+   return PUGL_SUCCESS;
+ }
+@@ -959,6 +1325,7 @@ puglFreeViewInternals(PuglView* const view)
+ {
+   if (view && view->impl) {
+     puglUnrealize(view);
++    free(view->impl->embeddingToken);
+     free(view->impl);
+   }
+ }
+@@ -966,7 +1333,8 @@ puglFreeViewInternals(PuglView* const view)
+ double
+ puglGetScaleFactor(const PuglView* const view)
+ {
+-  return view->world->impl->scaleFactor;
++  return view->impl->embeddedSurface ? view->impl->scale
++                                     : view->world->impl->scaleFactor;
+ }
+ 
+ PuglStatus
+@@ -1033,9 +1401,20 @@ puglRealize(PuglView* const view)
+ 
+   // Create Wayland surface
+   impl->wlSurface = wl_compositor_create_surface(world->impl->compositor);
++  wl_surface_add_listener(impl->wlSurface, &wl_surface_listener, view);
++
++  // Embed it into the host's surface
++  if (impl->embeddingToken && (st = embed(view))) {
++    unembed(view);
++    wl_surface_destroy(impl->wlSurface);
++    impl->wlSurface = NULL;
++    return st;
++  }
+ 
+-  // Set entire surface to opaque
+-  const PuglArea          size = puglGetSizeHint(view, PUGL_CURRENT_SIZE);
++  // Set entire surface to opaque (in surface coordinates, which are logical)
++  const PuglArea size = impl->embeddingToken
++                          ? impl->logicalSize
++                          : puglGetSizeHint(view, PUGL_CURRENT_SIZE);
+   struct wl_region* const region =
+     wl_compositor_create_region(world->impl->compositor);
+   wl_region_add(region, 0, 0, size.width, size.height);
+@@ -1081,8 +1460,25 @@ puglUnrealize(PuglView* const view)
+     view->backend->detach(view);
+   }
+ 
++  PuglWorldInternals* const world = view->world->impl;
++  if (world->enteredView == view) {
++    world->enteredView = NULL;
++  }
++  if (world->focusedView == view) {
++    world->focusedView = NULL;
++  }
++
++  cancelFrame(view);
++  unembed(view);
++  if (view->impl->cursorSurface) {
++    wl_surface_destroy(view->impl->cursorSurface);
++    view->impl->cursorSurface = NULL;
++    view->impl->cursorImage   = NULL;
++  }
++
+   wl_surface_destroy(view->impl->wlSurface);
+   view->impl->wlSurface = NULL;
++  view->lastConfigure.type = PUGL_NOTHING;
+   return PUGL_SUCCESS;
+ }
+ 
+@@ -1093,7 +1489,7 @@ puglShow(PuglView* const view, const PuglShowCommand PUGL_UNUSED(command))
+   PuglWorld* const     world = view->world;
+   PuglInternals* const impl  = view->impl;
+ 
+-  if (view->impl->xdgSurface) {
++  if (view->impl->xdgSurface || view->impl->embeddedShown) {
+     return PUGL_FAILURE;
+   }
+ 
+@@ -1101,6 +1497,23 @@ puglShow(PuglView* const view, const PuglShowCommand PUGL_UNUSED(command))
+     return st;
+   }
+ 
++  if (impl->embeddingToken) {
++    // An embedded surface is shown as soon as it has a buffer
++    if (!impl->embeddedSurface) {
++      return PUGL_FAILURE; // the host ended the embedding
++    }
++
++    impl->embeddedShown = true;
++    puglSetCursor(view, PUGL_CURSOR_ARROW);
++
++    const PuglEvent configureEvent = getCurrentConfiguration(view);
++    if (!(st = puglDispatchEvent(view, &configureEvent))) {
++      exposeNow(view);
++      wl_display_flush(world->impl->display);
++    }
++    return st;
++  }
++
+   impl->xdgSurface =
+     xdg_wm_base_get_xdg_surface(world->impl->wmBase, impl->wlSurface);
+ 
+@@ -1118,10 +1531,11 @@ puglShow(PuglView* const view, const PuglShowCommand PUGL_UNUSED(command))
+     wl_surface_damage_buffer(impl->wlSurface, 0, 0, INT32_MAX, INT32_MAX);
+     wl_surface_commit(view->impl->wlSurface);
+ 
+-    if (view->hints[PUGL_CONTINUOUS]) {
++    if (view->hints[PUGL_CONTINUOUS] && !impl->frameCallback) {
+       fprintf(stderr, "Starting frame listener\n");
+-      struct wl_callback* const cb = wl_surface_frame(view->impl->wlSurface);
+-      wl_callback_add_listener(cb, &wl_surface_frame_listener, view);
++      impl->frameCallback = wl_surface_frame(view->impl->wlSurface);
++      wl_callback_add_listener(
++        impl->frameCallback, &wl_surface_frame_listener, view);
+     }
+   }
+   return st;
+@@ -1134,10 +1548,23 @@ puglHide(PuglView* const view)
+     return PUGL_BAD_CALL;
+   }
+ 
++  if (view->impl->embeddedShown) {
++    view->impl->embeddedShown = false;
++    view->impl->exposePending = false;
++    cancelFrame(view);
++    wl_surface_attach(view->impl->wlSurface, NULL, 0, 0);
++    wl_surface_commit(view->impl->wlSurface);
++    wl_display_flush(view->world->impl->display);
++
++    const PuglEvent configureEvent = getCurrentConfiguration(view);
++    return puglDispatchEvent(view, &configureEvent);
++  }
++
+   if (!view->impl->xdgSurface) {
+     return PUGL_FAILURE;
+   }
+ 
++  cancelFrame(view);
+   xdg_toplevel_destroy(view->impl->toplevel);
+   xdg_surface_destroy(view->impl->xdgSurface);
+   wl_surface_attach(view->impl->wlSurface, NULL, 0, 0);
+@@ -1183,6 +1610,9 @@ PuglStatus
+ puglObscureView(PuglView* const view)
+ {
+   PuglStatus st = PUGL_SUCCESS;
++  if (view->world->state != PUGL_WORLD_EXPOSING) {
++    view->impl->exposePending = true;
++  }
+   if (view->world->state == PUGL_WORLD_UPDATING) {
+     wl_surface_damage_buffer(view->impl->wlSurface, 0, 0, INT32_MAX, INT32_MAX);
+   } else if (view->world->state == PUGL_WORLD_EXPOSING) {
+@@ -1204,6 +1634,9 @@ puglObscureRegion(PuglView* const view,
+   }
+ 
+   PuglStatus st = PUGL_SUCCESS;
++  if (view->world->state != PUGL_WORLD_EXPOSING) {
++    view->impl->exposePending = true;
++  }
+   if (view->world->state == PUGL_WORLD_UPDATING) {
+     wl_surface_damage_buffer(
+       view->impl->wlSurface, x, y, (int32_t)width, (int32_t)height);
+@@ -1316,10 +1749,15 @@ puglSetCursor(PuglView* const view, const PuglCursor cursor)
+ 
+   struct wl_cursor* const wlCursor =
+     wl_cursor_theme_get_cursor(world->impl->cursorTheme, cursorNames[cursor]);
++  if (!wlCursor) {
++    return PUGL_FAILURE;
++  }
+ 
+   view->impl->cursorImage = wlCursor->images[0];
+-  view->impl->cursorSurface =
+-    wl_compositor_create_surface(world->impl->compositor);
++  if (!view->impl->cursorSurface) {
++    view->impl->cursorSurface =
++      wl_compositor_create_surface(world->impl->compositor);
++  }
+ 
+   struct wl_buffer* const cursorBuffer =
+     wl_cursor_image_get_buffer(view->impl->cursorImage);
+@@ -1328,9 +1766,8 @@ puglSetCursor(PuglView* const view, const PuglCursor cursor)
+   wl_surface_commit(view->impl->cursorSurface);
+ 
+   if (view == world->impl->enteredView) {
+-    assert(view->impl->lastEnterSerial);
+     wl_pointer_set_cursor(world->impl->pointer,
+-                          view->impl->lastEnterSerial,
++                          world->impl->lastPointerSerial,
+                           view->impl->cursorSurface,
+                           (int32_t)view->impl->cursorImage->hotspot_x,
+                           (int32_t)view->impl->cursorImage->hotspot_y);
+diff --git a/src/wayland.h b/src/wayland.h
+index 58334c7..2c50de9 100644
+--- a/src/wayland.h
++++ b/src/wayland.h
+@@ -8,6 +8,7 @@
+ 
+ #include <pugl/pugl.h>
+ 
++#include <stdbool.h>
+ #include <stdint.h>
+ 
+ typedef int32_t wl_fixed_t;
+@@ -31,11 +32,16 @@ typedef int32_t wl_fixed_t;
+ 
+ struct PuglWorldInternalsImpl {
+   struct wl_display*      display;
++  bool                    ownsDisplay;
+   struct wl_registry*     registry;
+   struct wl_shm*          shm;
+   struct wl_compositor*   compositor;
++  uint32_t                compositorVersion;
+   struct wl_output*       output;
+   struct xdg_wm_base*     wmBase;
++  struct clap_surface_embedding_v1*       embedding;
++  struct wp_viewporter*                   viewporter;
++  struct wp_fractional_scale_manager_v1*  fractionalScaleManager;
+   struct wl_seat*         seat;
+   struct wl_pointer*      pointer;
+   struct wl_cursor_theme* cursorTheme;
+@@ -47,6 +53,8 @@ struct PuglWorldInternalsImpl {
+   uint32_t                ctrlModMask;
+   uint32_t                altModMask;
+   uint32_t                superModMask;
++  uint32_t                lastPointerSerial;
++  unsigned                numEglViews; // which share the EGL display
+   PuglMods                depressedMods;
+   int32_t                 scaleFactor;
+   PuglView*               enteredView;
+@@ -60,6 +68,18 @@ struct PuglInternalsImpl {
+   struct wl_surface*      cursorSurface;
+   struct wl_cursor_image* cursorImage;
+   PuglSurface*            backendSurface;
++  struct wl_callback*     frameCallback;
++  bool                    exposePending;
++
++  // Embedded in a host's surface, see puglSetWaylandEmbeddingToken()
++  char*                             embeddingToken;
++  struct clap_embedded_surface_v1*  embeddedSurface;
++  struct wp_viewport*               viewport;
++  struct wp_fractional_scale_v1*    fractionalScale;
++  bool                              embeddedShown;
++  bool                              hasFractionalScale; // wins over the integer one
++  double                            scale;
++  PuglArea                          logicalSize;
+   uint32_t                lastEnterSerial;
+   int32_t                 pointerX;
+   int32_t                 pointerY;
+diff --git a/src/wayland_gl.c b/src/wayland_gl.c
+index 58e2836..d8e3590 100644
+--- a/src/wayland_gl.c
++++ b/src/wayland_gl.c
+@@ -14,6 +14,7 @@
+ #include <EGL/egl.h>
+ #include <EGL/eglplatform.h>
+ 
++#include <stdbool.h>
+ #include <stdlib.h>
+ 
+ // NOLINTBEGIN(misc-misplaced-const)
+@@ -24,6 +25,7 @@ typedef struct {
+   struct wl_egl_window* eglWindow;
+   EGLSurface            eglSurface;
+   EGLContext            eglContext;
++  bool                  swapIntervalSet;
+ } PuglWaylandGlSurface;
+ 
+ static PuglArea
+@@ -181,6 +183,9 @@ puglWaylandGlAttach(PuglView* view)
+   backendSurface->eglSurface = eglSurface;
+   impl->backendSurface       = backendSurface;
+ 
++  // The views of the world share the display, until the last one goes
++  ++view->world->impl->numEglViews;
++
+   // Update possibly ambiguous hints to reflect reality
+   view->hints[PUGL_RED_BITS] =
+     puglEglGetConfigAttrib(eglDisplay, config, EGL_RED_SIZE);
+@@ -215,7 +220,9 @@ puglWaylandGlDetach(PuglView* const view)
+   if (surface) {
+     eglDestroySurface(surface->eglDisplay, surface->eglSurface);
+     wl_egl_window_destroy(surface->eglWindow);
+-    eglTerminate(surface->eglDisplay);
++    if (--view->world->impl->numEglViews == 0U) {
++      eglTerminate(surface->eglDisplay);
++    }
+ 
+     free(view->impl->backendSurface);
+     view->impl->backendSurface = NULL;
+@@ -297,12 +304,25 @@ puglWaylandGlEnter(PuglView* view, const PuglExposeEvent* PUGL_UNUSED(expose))
+       surface->eglWindow, viewSize.width, viewSize.height, 0, 0);
+   }
+ 
+-  return eglMakeCurrent(surface->eglDisplay,
+-                        surface->eglSurface,
+-                        surface->eglSurface,
+-                        surface->eglContext)
+-           ? PUGL_SUCCESS
+-           : PUGL_FAILURE;
++  if (!eglMakeCurrent(surface->eglDisplay,
++                      surface->eglSurface,
++                      surface->eglSurface,
++                      surface->eglContext)) {
++    return PUGL_FAILURE;
++  }
++
++  // An embedded view draws on its frame callbacks.  Swapping must never wait
++  // for the compositor, which would block the host when it doesn't show us.
++  if (!surface->swapIntervalSet) {
++    surface->swapIntervalSet = true;
++    if (view->impl->embeddingToken) {
++      eglSwapInterval(surface->eglDisplay, 0);
++    } else if (view->hints[PUGL_SWAP_INTERVAL] != PUGL_DONT_CARE) {
++      eglSwapInterval(surface->eglDisplay, view->hints[PUGL_SWAP_INTERVAL]);
++    }
++  }
++
++  return PUGL_SUCCESS;
+ }
+ 
+ static PuglStatus

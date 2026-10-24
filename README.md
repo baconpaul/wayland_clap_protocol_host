@@ -98,6 +98,8 @@ wave. The host never starts audio, though.
 |--------|-----------|----------|-------|
 | [`wayland-shm-demo`](plugins/wayland-shm-demo/wayland-shm-demo.cpp) | libwayland-client and `wl_shm`, nothing else | frame callbacks, with the connection's fd on the host's `posix-fd-support` | a plasma; the pointer moves a lens and clicks change the palette |
 | [`sdl3-demo`](plugins/sdl3-demo/sdl3-demo.cpp) | SDL3's renderer (OpenGL through EGL) | a 16 ms host timer which pumps SDL's events | sine waves, orbiting balls, click ripples, the renderer's name and fps |
+| [`visage-demo`](plugins/visage-demo/visage-demo.cpp) (patched Visage, off by default) | [Visage](https://github.com/VitalAudio/visage): bgfx and Vulkan | a timer fd of Visage's, on the host's `posix-fd-support` | rings, orbiting balls, click ripples |
+| [`pugl-demo`](plugins/pugl-demo/pugl-demo.cpp) (patched Pugl, off by default) | [Pugl](https://github.com/lv2/pugl): OpenGL through EGL | frame callbacks, with the connection's fd on the host's `posix-fd-support` | a Lissajous trail, turning squares, ripples for clicks and keys |
 | `example-plugins` target | Dear ImGui, from free-audio/clap-plugins | the plugins' own loop | synth, check-wayland-embed, and the other clap-plugins |
 
 `wayland-shm-demo` is the smallest complete example of the API:
@@ -121,6 +123,76 @@ connection between its instances:
 - The connection is only reused with the same `open_connection` function: another host in the
   same process could run another compositor.
 
+### Visage and Pugl: patched upstream, not in the default build
+
+> **`visage-demo` and `pugl-demo` need patched copies of Visage and Pugl.** Neither upstream
+> project can embed a surface through `clap-surface-embedding-v1`: upstream Visage has no Wayland
+> backend at all, and Pugl's Wayland backend is an unmerged work in progress which only makes
+> toplevels. The patches which add this live in [`patches/`](patches/), have not been sent
+> upstream, and are experiments. Both demos are off by default, and a plain `cmake -B build` builds
+> neither.
+
+| Patch | Applies to |
+|-------|------------|
+| [`patches/visage-wayland.patch`](patches/visage-wayland.patch) | [VitalAudio/visage](https://github.com/VitalAudio/visage) `main` at `7654e32` |
+| [`patches/pugl-wayland-embed.patch`](patches/pugl-wayland-embed.patch) | [lv2/pugl](https://github.com/lv2/pugl) `wayland` branch at `d28d56b` |
+
+With `-DBUILD_VISAGE_DEMO=ON` or `-DBUILD_PUGL_DEMO=ON`, CMake fetches that commit and applies the
+patch. Or point it at a checkout which already has the patch applied
+(`git -C ../visage apply /path/to/patches/visage-wayland.patch`). Pugl's `wayland` branch is
+rebased now and then, so its commit may disappear, and the patch may need porting.
+
+`visage-demo` needs the Wayland backend from the patch, and is only built on request since Visage
+fetches bgfx and FreeType:
+
+```bash
+sudo apt-get install libxkbcommon-dev libx11-dev libxrandr-dev   # Visage's X11 backend still builds
+cmake -B build -DBUILD_VISAGE_DEMO=ON                           # fetches Visage and patches it
+cmake -B build -DBUILD_VISAGE_DEMO=ON -DVISAGE_SOURCE_DIR=../visage  # or a patched checkout
+cmake --build build --target visage-demo
+```
+
+The backend (`visage_windowing/linux/windowing_wayland.cpp`) only embeds, through
+`createWaylandEmbeddedWindow(width, height, display, token)`:
+- **One connection:** Visage's renderer is global, and bgfx draws on one `wl_display`, so all the
+  instances share one connection. The plugin keeps it until it is unloaded, since the renderer
+  keeps using it.
+- **One fd per window:** an epoll fd holding the connection's fd and a frame timer. Each instance
+  registers its own window's fd with its own host, so no instance depends on another one's
+  registration.
+- **No vsync:** FIFO would block the host's main thread in the present whenever the window isn't
+  painted, for example while the screen is off. bgfx is patched to take MAILBOX instead, which
+  Mesa offers on Wayland in place of IMMEDIATE.
+- **Scale:** the fractional scale if the compositor sends it, else the integer one, with a viewport.
+- **bgfx's model window:** bgfx needs a window to initialize, which is a surface without a role
+  that is never shown.
+
+`pugl-demo` needs Pugl's Wayland backend plus the embedding from the patch. Pugl builds with meson,
+so `cmake/Pugl.cmake` compiles its Wayland and OpenGL sources itself:
+
+```bash
+sudo apt-get install libxkbcommon-dev libwayland-dev libegl-dev libgl-dev
+cmake -B build -DBUILD_PUGL_DEMO=ON                          # fetches Pugl and patches it
+cmake -B build -DBUILD_PUGL_DEMO=ON -DPUGL_SOURCE_DIR=../pugl  # or a patched checkout
+cmake --build build --target pugl-demo
+```
+
+The embedding (`include/pugl/wayland.h` there) is two functions:
+- **`puglNewWaylandWorld(type, flags, display)`** makes a world on the host's connection, which
+  the world doesn't own. A world without a seat or a shell is fine: only toplevels need them.
+- **`puglSetWaylandEmbeddingToken(view, token)`** in place of `puglSetParent()`. The view is
+  embedded when it is realized, which fails if the compositor refuses the token.
+
+And how it behaves:
+- **One world:** all the instances share one world on one connection, which goes with the last
+  GUI. Each instance registers the connection's fd with its own host, and any of them runs
+  `puglUpdate(world, 0)` for all the views.
+- **Frame callbacks:** a view draws once when shown, then on its frame callbacks while it is
+  continuous or asked to redraw. EGL's swap interval is 0, so that a swap never waits for the
+  compositor.
+- **Scale:** the default size is in logical pixels, and the view is configured at that size times
+  the fractional (else integer) scale, with a viewport. Pointer coordinates are scaled to match.
+
 ## Layout
 
 | Path | What |
@@ -132,6 +204,8 @@ connection between its instances:
 | `src/decorations.*` | the title bars which the compositor draws around the plugins' own windows |
 | `cmake/WaylandProtocols.cmake` | `wayland_target_protocols(target [SERVER] xml...)` around wayland-scanner |
 | `cmake/ExampleClapPlugins.cmake` | the `example-plugins` target: free-audio/clap-plugins, pinned with `CLAP_PLUGINS_TAG` |
+| `cmake/Visage.cmake`, `cmake/Pugl.cmake` | the optional `visage-demo` and `pugl-demo`: fetch, patch, build |
+| `patches/` | the patches to Visage and Pugl which those two demos need |
 | `plugins/` | the example plugins |
 | `libs/` | `clap` and `clap-wayland-experiment`, as submodules |
 

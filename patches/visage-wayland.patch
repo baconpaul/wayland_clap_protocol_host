@@ -1,0 +1,1177 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 075bd58..f190d24 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -21,6 +21,7 @@ option(VISAGE_ENABLE_WIDGETS "Add widgets library" ON)
+ option(VISAGE_ENABLE_BACKGROUND_GRAPHICS_THREAD "Offloads graphics rendering to a background thread" OFF)
+ option(VISAGE_ENABLE_GRAPHICS_DEBUG_LOGGING "Shows graphics debug log in console in debug mode" OFF)
+ option(VISAGE_ADDRESS_SANITIZER "Enable AddressSanitizer" OFF)
++option(VISAGE_WAYLAND "Linux: plugin windows embedded through a host's nested Wayland compositor" OFF)
+ 
+ if (VISAGE_ADDRESS_SANITIZER)
+   if (MSVC)
+diff --git a/visage_app/application_editor.cpp b/visage_app/application_editor.cpp
+index 4d739c0..d97aead 100644
+--- a/visage_app/application_editor.cpp
++++ b/visage_app/application_editor.cpp
+@@ -114,7 +114,7 @@ namespace visage {
+   void ApplicationEditor::addToWindow(Window* window) {
+     window_ = window;
+ 
+-    Renderer::instance().initialize(window_->initWindow(), window->globalDisplay());
++    Renderer::instance().initialize(window_->initWindow(), window->globalDisplay(), window->usesWayland());
+     canvas_->pairToWindow(window_->nativeHandle(), window->clientWidth(), window->clientHeight());
+     top_level_->setDpiScale(window_->dpiScale());
+     top_level_->setNativeBounds(0, 0, window->clientWidth(), window->clientHeight());
+diff --git a/visage_app/application_window.cpp b/visage_app/application_window.cpp
+index 1ff8779..b7c4cdf 100644
+--- a/visage_app/application_window.cpp
++++ b/visage_app/application_window.cpp
+@@ -86,6 +86,14 @@ namespace visage {
+     showWindow(false);
+   }
+ 
++  void ApplicationWindow::show(std::unique_ptr<Window> window) {
++    removeFromWindow();
++    window_ = std::move(window);
++    setDpiScale(window_->dpiScale());
++    setNativeBounds({ 0, 0, window_->clientWidth(), window_->clientHeight() });
++    showWindow(false);
++  }
++
+   void ApplicationWindow::showMaximized() {
+     static constexpr float kUnmaximizedWidthPercent = 85.0f;
+ 
+diff --git a/visage_app/application_window.h b/visage_app/application_window.h
+index b36ba0f..028209a 100644
+--- a/visage_app/application_window.h
++++ b/visage_app/application_window.h
+@@ -59,6 +59,9 @@ namespace visage {
+     void show(const Dimension& width, const Dimension& height, void* parent_window);
+     void show(const Dimension& width, const Dimension& height);
+     void show(const Dimension& x, const Dimension& y, const Dimension& width, const Dimension& height);
++    // Shows the editor in a window which the caller created, for example with
++    // createWaylandEmbeddedWindow()
++    void show(std::unique_ptr<Window> window);
+     void showMaximized();
+     void hide();
+     void close();
+diff --git a/visage_graphics/CMakeLists.txt b/visage_graphics/CMakeLists.txt
+index b189596..72eb6ea 100644
+--- a/visage_graphics/CMakeLists.txt
++++ b/visage_graphics/CMakeLists.txt
+@@ -63,6 +63,7 @@ set(CMAKE_MESSAGE_LOG_LEVEL "ERROR")
+ FetchContent_Declare(bgfx GIT_REPOSITORY https://github.com/bkaradzic/bgfx.cmake.git
+   GIT_SHALLOW TRUE
+   GIT_TAG v1.129.8958-499
++  PATCH_COMMAND ${CMAKE_COMMAND} -DBGFX_SOURCE_DIR=<SOURCE_DIR> -P ${CMAKE_CURRENT_SOURCE_DIR}/patch_bgfx.cmake
+   EXCLUDE_FROM_ALL
+ )
+ FetchContent_MakeAvailable(bgfx)
+diff --git a/visage_graphics/patch_bgfx.cmake b/visage_graphics/patch_bgfx.cmake
+new file mode 100644
+index 0000000..4ae5123
+--- /dev/null
++++ b/visage_graphics/patch_bgfx.cmake
+@@ -0,0 +1,19 @@
++# Applied to bgfx once it is fetched (cmake -DBGFX_SOURCE_DIR=... -P patch_bgfx.cmake).
++#
++# Vulkan: without vsync, take MAILBOX when there is no IMMEDIATE (Mesa on Wayland) rather than
++# falling back to FIFO. FIFO waits for the compositor, which may never come for a window that isn't
++# painted, for example a plugin's window while the host is minimized: the present would block the
++# main thread.
++
++set(FILE "${BGFX_SOURCE_DIR}/bgfx/src/renderer_vk.cpp")
++file(READ "${FILE}" CONTENT)
++set(TAB "\t")
++string(REPLACE
++  "${TAB}${TAB}{ VK_PRESENT_MODE_MAILBOX_KHR,      true,  \"VK_PRESENT_MODE_MAILBOX_KHR\"      },\n${TAB}${TAB}{ VK_PRESENT_MODE_IMMEDIATE_KHR,    false, \"VK_PRESENT_MODE_IMMEDIATE_KHR\"    },"
++  "${TAB}${TAB}{ VK_PRESENT_MODE_IMMEDIATE_KHR,    false, \"VK_PRESENT_MODE_IMMEDIATE_KHR\"    },\n${TAB}${TAB}{ VK_PRESENT_MODE_MAILBOX_KHR,      false, \"VK_PRESENT_MODE_MAILBOX_KHR\"      },"
++  PATCHED "${CONTENT}")
++if (NOT PATCHED STREQUAL CONTENT)
++  file(WRITE "${FILE}" "${PATCHED}")
++elseif (NOT CONTENT MATCHES "VK_PRESENT_MODE_MAILBOX_KHR,      false")
++  message(WARNING "visage: bgfx's present modes have changed, the MAILBOX patch doesn't apply")
++endif ()
+diff --git a/visage_graphics/renderer.cpp b/visage_graphics/renderer.cpp
+index 1da2817..be712c6 100644
+--- a/visage_graphics/renderer.cpp
++++ b/visage_graphics/renderer.cpp
+@@ -101,7 +101,7 @@ namespace visage {
+       bgfx::renderFrame(kRenderTimeout);
+   }
+ 
+-  void Renderer::initialize(void* model_window, void* display) {
++  void Renderer::initialize(void* model_window, void* display, bool wayland) {
+     if (initialized_)
+       return;
+ 
+@@ -118,6 +118,14 @@ namespace visage {
+     bgfx_init.platformData.ndt = display;
+     bgfx_init.platformData.nwh = model_window;
+     bgfx_init.platformData.type = bgfx::NativeWindowHandleType::Default;
++#if VISAGE_LINUX
++    if (wayland) {
++      bgfx_init.platformData.type = bgfx::NativeWindowHandleType::Wayland;
++      // The model window is a surface which is never shown: its swap chain needs a size
++      bgfx_init.resolution.width = 1;
++      bgfx_init.resolution.height = 1;
++    }
++#endif
+ 
+     bgfx::RendererType::Enum supported_renderers[bgfx::RendererType::Count];
+     uint8_t num_supported = bgfx::getSupportedRenderers(bgfx::RendererType::Count, supported_renderers);
+@@ -141,6 +149,13 @@ namespace visage {
+ #endif
+ 
+     bgfx_init.resolution.reset = resetFlags();
++#if VISAGE_LINUX
++    // Never wait for the compositor: a plugin's window may not be painted at all, for example while
++    // the host's window is minimized or the screen is off, and FIFO would then block the host's main
++    // thread in the present. The window's own timer paces the frames instead.
++    if (wayland)
++      bgfx_init.resolution.reset = 0;
++#endif
+ 
+     for (int i = 0; i < num_supported && !supported_; ++i)
+       supported_ = supported_renderers[i] == bgfx_init.type;
+diff --git a/visage_graphics/renderer.h b/visage_graphics/renderer.h
+index ec640f8..693a732 100644
+--- a/visage_graphics/renderer.h
++++ b/visage_graphics/renderer.h
+@@ -38,7 +38,8 @@ namespace visage {
+     static void resetResolution(int width, int height);
+ 
+     void initializeWindowless() { initialize(windowlessContext(), nullptr); }
+-    void initialize(void* model_window, void* display);
++    // On Linux, the handles are Wayland's (wl_surface, wl_display) when wayland is true
++    void initialize(void* model_window, void* display, bool wayland = false);
+     void setScreenshotData(const uint8_t* data, int width, int height, int pitch, bool blue_red);
+     const Screenshot& screenshot() const { return screenshot_; }
+ 
+diff --git a/visage_windowing/CMakeLists.txt b/visage_windowing/CMakeLists.txt
+index 8ef704b..ecc4e7a 100644
+--- a/visage_windowing/CMakeLists.txt
++++ b/visage_windowing/CMakeLists.txt
+@@ -15,6 +15,36 @@ elseif (UNIX)
+   find_package(X11 REQUIRED)
+   set(X11_LIBS ${X11_LIBRARIES} ${X11_Xrandr_LIB})
+   set(X11_INCLUDES ${X11_INCLUDE_DIR} ${Xrandr_INCLUDE_DIR})
++
++  # Plugin windows embedded through a host's nested Wayland compositor (clap-wayland-experiment)
++  if (VISAGE_WAYLAND)
++    find_package(PkgConfig REQUIRED)
++    pkg_check_modules(VISAGE_WAYLAND_DEPS REQUIRED IMPORTED_TARGET wayland-client xkbcommon)
++    pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
++    pkg_get_variable(WAYLAND_SCANNER wayland-scanner wayland_scanner)
++    if (NOT WAYLAND_PROTOCOLS_DIR OR NOT WAYLAND_SCANNER)
++      message(FATAL_ERROR "VISAGE_WAYLAND needs wayland-protocols and wayland-scanner")
++    endif ()
++
++    set(WAYLAND_PROTOCOL_DIR ${CMAKE_CURRENT_BINARY_DIR}/wayland-protocols)
++    file(MAKE_DIRECTORY ${WAYLAND_PROTOCOL_DIR})
++    foreach (XML
++        ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml
++        ${WAYLAND_PROTOCOLS_DIR}/stable/viewporter/viewporter.xml
++        ${WAYLAND_PROTOCOLS_DIR}/staging/fractional-scale/fractional-scale-v1.xml
++        ${CMAKE_CURRENT_SOURCE_DIR}/linux/protocols/clap-surface-embedding-v1.xml)
++      get_filename_component(NAME ${XML} NAME_WE)
++      add_custom_command(
++        OUTPUT ${WAYLAND_PROTOCOL_DIR}/${NAME}-client-protocol.h ${WAYLAND_PROTOCOL_DIR}/${NAME}-protocol.c
++        COMMAND ${WAYLAND_SCANNER} client-header ${XML} ${WAYLAND_PROTOCOL_DIR}/${NAME}-client-protocol.h
++        COMMAND ${WAYLAND_SCANNER} private-code ${XML} ${WAYLAND_PROTOCOL_DIR}/${NAME}-protocol.c
++        DEPENDS ${XML}
++        VERBATIM)
++      list(APPEND PLATFORM_SOURCE_FILES ${WAYLAND_PROTOCOL_DIR}/${NAME}-protocol.c)
++      list(APPEND PLATFORM_HEADER_FILES ${WAYLAND_PROTOCOL_DIR}/${NAME}-client-protocol.h)
++    endforeach ()
++    set(WAYLAND_LIBS PkgConfig::VISAGE_WAYLAND_DEPS)
++  endif ()
+ endif ()
+ 
+ file(GLOB HEADERS *.h)
+@@ -29,8 +59,12 @@ target_include_directories(VisageWindowing
+   ${CMAKE_CURRENT_SOURCE_DIR}
+   ${VISAGE_INCLUDE_PATH}
+   ${X11_INCLUDES}
++  ${WAYLAND_PROTOCOL_DIR}
+ )
+-target_link_libraries(VisageWindowing PRIVATE ${X11_LIBS} ${WIN_LIBS})
++target_link_libraries(VisageWindowing PRIVATE ${X11_LIBS} ${WAYLAND_LIBS} ${WIN_LIBS})
++if (VISAGE_WAYLAND)
++  target_compile_definitions(VisageWindowing PRIVATE VISAGE_WAYLAND=1)
++endif ()
+ 
+ set_target_properties(VisageWindowing PROPERTIES FOLDER "visage")
+ if (APPLE)
+diff --git a/visage_windowing/linux/protocols/clap-surface-embedding-v1.xml b/visage_windowing/linux/protocols/clap-surface-embedding-v1.xml
+new file mode 100644
+index 0000000..5bd5979
+--- /dev/null
++++ b/visage_windowing/linux/protocols/clap-surface-embedding-v1.xml
+@@ -0,0 +1,176 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="clap_surface_embedding_v1">
++  <copyright>
++    Copyright (c) 2026 free-audio
++
++    Permission is hereby granted, free of charge, to any person obtaining a
++    copy of this software and associated documentation files (the "Software"),
++    to deal in the Software without restriction, including without limitation
++    the rights to use, copy, modify, merge, publish, distribute, sublicense,
++    and/or sell copies of the Software, and to permit persons to whom the
++    Software is furnished to do so, subject to the following conditions:
++
++    The above copyright notice and this permission notice (including the next
++    paragraph) shall be included in all copies or substantial portions of the
++    Software.
++
++    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++    DEALINGS IN THE SOFTWARE.
++  </copyright>
++
++  <description summary="embed a client's surface into a window of the host application">
++    This protocol lets a client embed its surface into a window of a host
++    application, which runs the compositor that the client is connected to.
++
++    For example, an audio application runs a Wayland compositor of its own,
++    which forwards the requests of its clients to the system compositor, and
++    its plugins embed their user interfaces into its windows. See the
++    clap_plugin_gui_wayland_nested_compositor extension in
++    include/clap/ext/draft/wayland-experiment.h.
++
++    The host application gives an embedding token to the client by other means
++    than this protocol, for example with the CLAP plugin API. The client
++    creates a wl_surface, and embeds it with get_embedded_surface and the
++    token.
++
++    This protocol is experimental. It is based on the ext_surface_embedding_v1
++    draft by jwolffpsl:
++    https://github.com/free-audio/clap/issues/474#issuecomment-4177525720
++  </description>
++
++  <interface name="clap_surface_embedding_v1" version="1">
++    <description summary="embed surfaces into windows of the host application">
++      The compositor of the host application exposes this global.
++    </description>
++
++    <enum name="error">
++      <entry name="role" value="0"
++             summary="the wl_surface already has another role"/>
++      <entry name="already_embedded" value="1"
++             summary="the wl_surface already has a clap_embedded_surface_v1 object"/>
++    </enum>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the clap_surface_embedding_v1 object">
++        Destroys this object. The embedded surfaces which it created remain.
++      </description>
++    </request>
++
++    <request name="get_embedded_surface">
++      <description summary="embed a surface">
++        Gives the wl_surface the embedded surface role, and embeds it at the
++        place which the token designates.
++
++        The token is an opaque string, which the host application gave to the
++        client by other means. If the compositor doesn't know the token, if
++        another embedded surface already uses it, or if the compositor refuses
++        the embedding for any other reason, it sends the closed event to the new
++        object. Any client of the compositor could present a token, so the host
++        application should make its tokens hard to guess.
++
++        It is a protocol error to give a wl_surface which already has another
++        role, or which already has a clap_embedded_surface_v1 object. After its
++        clap_embedded_surface_v1 object is destroyed, the wl_surface may be
++        embedded again.
++      </description>
++      <arg name="id" type="new_id" interface="clap_embedded_surface_v1"/>
++      <arg name="surface" type="object" interface="wl_surface"/>
++      <arg name="token" type="string" summary="embedding token from the host application"/>
++    </request>
++  </interface>
++
++  <interface name="clap_embedded_surface_v1" version="1">
++    <description summary="a surface embedded into a window of the host application">
++      An embedded surface appears inside a window of the host application, at
++      the place which the host application chose. The compositor positions it;
++      the client can't.
++
++      The surface is mapped when a buffer is attached and committed, and
++      unmapped when a null buffer is committed. Its size is the size of its
++      buffer, or of its viewport, and the host application and the client agree
++      on it by other means than this protocol, for example with the CLAP plugin
++      API. The compositor may clip the surface to the area which the host
++      application reserved for it.
++
++      The compositor applies the surface's commits as soon as possible, as for a
++      desynchronized wl_subsurface. It may synchronize them with the host
++      application's own commits, for example while the area is resized, so that
++      both appear at once.
++
++      The surface receives input events like any other surface. The compositor
++      gives it the keyboard focus as it sees fit, for example when the user
++      clicks into it.
++
++      For its popups, like menus and tooltips, and for its dialogs, the client
++      uses the standard protocols on the same connection, with the parents
++      which get_parent_surface and get_parent_toplevel give.
++
++      If the wl_surface is destroyed, this object becomes inert: the compositor
++      ignores its requests, and the client should destroy it.
++    </description>
++
++    <request name="destroy" type="destructor">
++      <description summary="stop embedding the surface">
++        Unmaps the surface, and destroys this object.
++      </description>
++    </request>
++
++    <request name="get_parent_surface">
++      <description summary="get the parent surface, for popups">
++        Creates an xdg_surface object which refers to the host application's
++        surface containing the embedded surface: the closest xdg_surface, a
++        toplevel or a popup, among the embedded surface's ancestors. The client
++        uses it as the parent of its popups, with xdg_surface.get_popup, and
++        places them with the position event.
++
++        The new object only stands for the host application's surface. The
++        compositor ignores all its requests except destroy, and sends no event
++        on it. The client destroys it when it doesn't need it anymore.
++      </description>
++      <arg name="id" type="new_id" interface="xdg_surface"/>
++    </request>
++
++    <request name="get_parent_toplevel">
++      <description summary="get the parent toplevel, for dialogs">
++        Creates an xdg_toplevel object which refers to the host application's
++        toplevel containing the embedded surface. The client uses it as the
++        parent of its own toplevels, for example its dialogs, with
++        xdg_toplevel.set_parent.
++
++        The new object only stands for the host application's toplevel. The
++        compositor ignores all its requests except destroy, and sends no event
++        on it. The client destroys it when it doesn't need it anymore.
++      </description>
++      <arg name="id" type="new_id" interface="xdg_toplevel"/>
++    </request>
++
++    <event name="position">
++      <description summary="position in the parent surface">
++        The position of the embedded surface's top left corner, relative to the
++        window geometry of the parent surface (see get_parent_surface), in the
++        parent's surface-local coordinates. The client needs it to place its
++        popups with xdg_positioner.
++
++        The compositor sends it right after get_embedded_surface, unless it
++        sends closed, and whenever the position changes.
++      </description>
++      <arg name="x" type="int"/>
++      <arg name="y" type="int"/>
++    </event>
++
++    <event name="closed">
++      <description summary="the embedding ended">
++        The compositor ended the embedding, or refused it: for example the
++        token was unknown or already in use, or the host application removed
++        the place which the token designated. The surface is unmapped, the
++        compositor ignores the requests on this object, and the client should
++        destroy it.
++      </description>
++    </event>
++  </interface>
++</protocol>
+diff --git a/visage_windowing/linux/windowing_wayland.cpp b/visage_windowing/linux/windowing_wayland.cpp
+new file mode 100644
+index 0000000..c6a0922
+--- /dev/null
++++ b/visage_windowing/linux/windowing_wayland.cpp
+@@ -0,0 +1,630 @@
++/* Copyright Vital Audio, LLC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ */
++
++#if VISAGE_LINUX && VISAGE_WAYLAND
++#include "windowing_wayland.h"
++
++#include "visage_utils/time_utils.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <linux/input-event-codes.h>
++#include <map>
++#include <memory>
++#include <poll.h>
++#include <sys/epoll.h>
++#include <sys/mman.h>
++#include <sys/timerfd.h>
++#include <unistd.h>
++#include <vector>
++#include <wayland-client.h>
++#include <xkbcommon/xkbcommon.h>
++
++// clang-format off
++#include "fractional-scale-v1-client-protocol.h"
++#include "viewporter-client-protocol.h"
++#include "xdg-shell-client-protocol.h"
++#include "clap-surface-embedding-v1-client-protocol.h" // after xdg-shell's
++// clang-format on
++
++namespace visage {
++  KeyCode translateKeysym(unsigned int keysym); // windowing_x11.cpp
++
++  // What the windows on one wl_display share: its globals and its input. It lives as long as the
++  // process, since bgfx keeps using the display's surfaces until then.
++  class WaylandConnection {
++  public:
++    // A destroyed window's surface stays this many ticks, until bgfx has released its swap chain
++    static constexpr int kRetiredSurfaceTicks = 8;
++
++    static WaylandConnection* forDisplay(wl_display* display) {
++      static std::map<wl_display*, std::unique_ptr<WaylandConnection>> connections;
++      auto& connection = connections[display];
++      if (connection == nullptr)
++        connection.reset(new WaylandConnection(display));
++      return connection.get();
++    }
++
++    wl_compositor* compositor() const { return compositor_; }
++    clap_surface_embedding_v1* embedding() const { return embedding_; }
++    wp_viewporter* viewporter() const { return viewporter_; }
++    wp_fractional_scale_manager_v1* fractionalScaleManager() const {
++      return fractional_scale_manager_;
++    }
++
++    void addWindow(WindowWayland* window) { windows_.push_back(window); }
++
++    void removeWindow(WindowWayland* window) {
++      windows_.erase(std::remove(windows_.begin(), windows_.end(), window), windows_.end());
++      if (pointer_focus_ == window)
++        pointer_focus_ = nullptr;
++      if (keyboard_focus_ == window) {
++        keyboard_focus_ = nullptr;
++        repeat_key_ = 0;
++      }
++    }
++
++    void retireSurface(wl_surface* surface) { retired_surfaces_.push_back({ surface, kRetiredSurfaceTicks }); }
++
++    // The model window for bgfx's initialization, which is never shown
++    wl_surface* modelSurface() {
++      if (model_surface_ == nullptr && compositor_)
++        model_surface_ = wl_compositor_create_surface(compositor_);
++      return model_surface_;
++    }
++
++    // Reads and dispatches the events which are there, without waiting
++    void dispatch() {
++      while (wl_display_prepare_read(display_) != 0)
++        wl_display_dispatch_pending(display_);
++      wl_display_flush(display_);
++
++      pollfd fd = { wl_display_get_fd(display_), POLLIN, 0 };
++      if (poll(&fd, 1, 0) > 0)
++        wl_display_read_events(display_);
++      else
++        wl_display_cancel_read(display_);
++
++      wl_display_dispatch_pending(display_);
++      wl_display_flush(display_);
++    }
++
++    // From the windows' timers: the key repeats, and the retired surfaces
++    void tick() {
++      for (auto it = retired_surfaces_.begin(); it != retired_surfaces_.end();) {
++        if (--it->second > 0) {
++          ++it;
++          continue;
++        }
++        wl_surface_destroy(it->first);
++        it = retired_surfaces_.erase(it);
++      }
++
++      if (repeat_key_ && keyboard_focus_ && repeat_rate_ > 0) {
++        long long now = time::microseconds();
++        while (now >= next_repeat_microseconds_) {
++          next_repeat_microseconds_ += 1000000 / repeat_rate_;
++          keyDown(repeat_key_, true);
++        }
++      }
++    }
++
++  private:
++    explicit WaylandConnection(wl_display* display) : display_(display) {
++      static const wl_registry_listener registry_listener = {
++        .global =
++            [](void* data, wl_registry* registry, uint32_t name, const char* interface, uint32_t version) {
++              static_cast<WaylandConnection*>(data)->onGlobal(registry, name, interface, version);
++            },
++        .global_remove = [](void*, wl_registry*, uint32_t) {},
++      };
++      xkb_context_ = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
++      registry_ = wl_display_get_registry(display_);
++      wl_registry_add_listener(registry_, &registry_listener, this);
++      wl_display_roundtrip(display_);
++      // The seat's capabilities
++      wl_display_roundtrip(display_);
++    }
++
++    WindowWayland* findWindow(wl_surface* surface) const {
++      for (WindowWayland* window : windows_) {
++        if (window->surface_ == surface)
++          return window;
++      }
++      return nullptr;
++    }
++
++    void onGlobal(wl_registry* registry, uint32_t name, const char* interface, uint32_t version) {
++      if (strcmp(interface, wl_compositor_interface.name) == 0 && version >= 4) {
++        compositor_ = static_cast<wl_compositor*>(
++            wl_registry_bind(registry, name, &wl_compositor_interface, std::min(version, 6u)));
++      }
++      else if (strcmp(interface, clap_surface_embedding_v1_interface.name) == 0) {
++        embedding_ = static_cast<clap_surface_embedding_v1*>(
++            wl_registry_bind(registry, name, &clap_surface_embedding_v1_interface, 1));
++      }
++      else if (strcmp(interface, wp_viewporter_interface.name) == 0) {
++        viewporter_ = static_cast<wp_viewporter*>(wl_registry_bind(registry, name, &wp_viewporter_interface, 1));
++      }
++      else if (strcmp(interface, wp_fractional_scale_manager_v1_interface.name) == 0) {
++        fractional_scale_manager_ = static_cast<wp_fractional_scale_manager_v1*>(
++            wl_registry_bind(registry, name, &wp_fractional_scale_manager_v1_interface, 1));
++      }
++      else if (strcmp(interface, wl_seat_interface.name) == 0 && seat_ == nullptr && version >= 5) {
++        static const wl_seat_listener seat_listener = {
++          .capabilities = [](void* data, wl_seat*,
++                             uint32_t capabilities) { static_cast<WaylandConnection*>(data)->onSeat(capabilities); },
++          .name = [](void*, wl_seat*, const char*) {},
++        };
++        seat_ = static_cast<wl_seat*>(wl_registry_bind(registry, name, &wl_seat_interface, 5));
++        wl_seat_add_listener(seat_, &seat_listener, this);
++      }
++    }
++
++    void onSeat(uint32_t capabilities);
++
++    int modifiers() const {
++      if (xkb_state_ == nullptr)
++        return kModifierNone;
++      auto active = [this](const char* name) {
++        return xkb_state_mod_name_is_active(xkb_state_, name, XKB_STATE_MODS_EFFECTIVE) > 0;
++      };
++      int result = kModifierNone;
++      if (active(XKB_MOD_NAME_SHIFT))
++        result |= kModifierShift;
++      if (active(XKB_MOD_NAME_CTRL))
++        result |= kModifierRegCtrl;
++      if (active(XKB_MOD_NAME_ALT))
++        result |= kModifierAlt;
++      if (active(XKB_MOD_NAME_LOGO))
++        result |= kModifierMeta;
++      return result;
++    }
++
++    IPoint nativePointer() const {
++      return pointer_focus_->convertToNative(Point(pointer_x_, pointer_y_));
++    }
++
++    void keyDown(uint32_t keycode, bool repeat) {
++      if (keyboard_focus_ == nullptr || xkb_state_ == nullptr)
++        return;
++
++      int mods = modifiers();
++      char text[32] {};
++      xkb_state_key_get_utf8(xkb_state_, keycode, text, sizeof(text));
++      bool is_text = text[0] && static_cast<unsigned char>(text[0]) >= 0x20 && text[0] != 0x7f;
++      if ((mods & (kModifierRegCtrl | kModifierAlt | kModifierMeta)) == 0 && is_text)
++        keyboard_focus_->handleTextInput(text);
++
++      KeyCode key_code = translateKeysym(xkb_state_key_get_one_sym(xkb_state_, keycode));
++      if (key_code != KeyCode::Unknown)
++        keyboard_focus_->handleKeyDown(key_code, mods, repeat);
++    }
++
++    wl_display* display_ = nullptr;
++    wl_registry* registry_ = nullptr;
++    wl_compositor* compositor_ = nullptr;
++    clap_surface_embedding_v1* embedding_ = nullptr;
++    wp_viewporter* viewporter_ = nullptr;
++    wp_fractional_scale_manager_v1* fractional_scale_manager_ = nullptr;
++    wl_seat* seat_ = nullptr;
++    wl_pointer* pointer_ = nullptr;
++    wl_keyboard* keyboard_ = nullptr;
++    wl_surface* model_surface_ = nullptr;
++
++    std::vector<WindowWayland*> windows_;
++    std::vector<std::pair<wl_surface*, int>> retired_surfaces_;
++
++    WindowWayland* pointer_focus_ = nullptr;
++    double pointer_x_ = 0.0;
++    double pointer_y_ = 0.0;
++    int button_state_ = kMouseButtonNone;
++    float wheel_x_ = 0.0f;
++    float wheel_y_ = 0.0f;
++    bool wheel_discrete_ = false;
++
++    xkb_context* xkb_context_ = nullptr;
++    xkb_keymap* xkb_keymap_ = nullptr;
++    xkb_state* xkb_state_ = nullptr;
++    WindowWayland* keyboard_focus_ = nullptr;
++    uint32_t repeat_key_ = 0;
++    int repeat_rate_ = 25;
++    int repeat_delay_ = 600;
++    long long next_repeat_microseconds_ = 0;
++  };
++
++  static MouseButton mouseButtonFromWayland(uint32_t button) {
++    switch (button) {
++    case BTN_LEFT: return kMouseButtonLeft;
++    case BTN_MIDDLE: return kMouseButtonMiddle;
++    case BTN_RIGHT: return kMouseButtonRight;
++    default: return kMouseButtonNone;
++    }
++  }
++
++  void WaylandConnection::onSeat(uint32_t capabilities) {
++    static const wl_pointer_listener pointer_listener = {
++      .enter =
++          [](void* data, wl_pointer*, uint32_t, wl_surface* surface, wl_fixed_t x, wl_fixed_t y) {
++            auto c = static_cast<WaylandConnection*>(data);
++            c->pointer_focus_ = c->findWindow(surface);
++            c->pointer_x_ = wl_fixed_to_double(x);
++            c->pointer_y_ = wl_fixed_to_double(y);
++            if (c->pointer_focus_) {
++              IPoint p = c->nativePointer();
++              c->pointer_focus_->handleMouseEnter(p.x, p.y);
++            }
++          },
++      .leave =
++          [](void* data, wl_pointer*, uint32_t, wl_surface*) {
++            auto c = static_cast<WaylandConnection*>(data);
++            if (c->pointer_focus_)
++              c->pointer_focus_->handleMouseLeave(c->button_state_, c->modifiers());
++            c->pointer_focus_ = nullptr;
++            c->button_state_ = kMouseButtonNone;
++          },
++      .motion =
++          [](void* data, wl_pointer*, uint32_t, wl_fixed_t x, wl_fixed_t y) {
++            auto c = static_cast<WaylandConnection*>(data);
++            c->pointer_x_ = wl_fixed_to_double(x);
++            c->pointer_y_ = wl_fixed_to_double(y);
++            if (c->pointer_focus_) {
++              IPoint p = c->nativePointer();
++              c->pointer_focus_->handleMouseMove(p.x, p.y, c->button_state_, c->modifiers());
++            }
++          },
++      .button =
++          [](void* data, wl_pointer*, uint32_t, uint32_t, uint32_t button, uint32_t state) {
++            auto c = static_cast<WaylandConnection*>(data);
++            MouseButton mouse_button = mouseButtonFromWayland(button);
++            if (c->pointer_focus_ == nullptr || mouse_button == kMouseButtonNone)
++              return;
++
++            IPoint p = c->nativePointer();
++            if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
++              c->button_state_ |= mouse_button;
++              c->pointer_focus_->handleMouseDown(mouse_button, p.x, p.y, c->button_state_, c->modifiers());
++            }
++            else {
++              c->button_state_ &= ~mouse_button;
++              c->pointer_focus_->handleMouseUp(mouse_button, p.x, p.y, c->button_state_, c->modifiers());
++            }
++          },
++      .axis =
++          [](void* data, wl_pointer*, uint32_t, uint32_t axis, wl_fixed_t value) {
++            // Smooth scrolling, about 10 per notch: down and right are positive
++            auto c = static_cast<WaylandConnection*>(data);
++            if (c->wheel_discrete_)
++              return;
++            float delta = -static_cast<float>(wl_fixed_to_double(value)) / 10.0f;
++            if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
++              c->wheel_y_ += delta;
++            else
++              c->wheel_x_ += delta;
++          },
++      .frame =
++          [](void* data, wl_pointer*) {
++            auto c = static_cast<WaylandConnection*>(data);
++            if (c->pointer_focus_ && (c->wheel_x_ != 0.0f || c->wheel_y_ != 0.0f)) {
++              IPoint p = c->nativePointer();
++              c->pointer_focus_->handleMouseWheel(c->wheel_x_, c->wheel_y_, p.x, p.y,
++                                                  c->button_state_, c->modifiers());
++            }
++            c->wheel_x_ = c->wheel_y_ = 0.0f;
++            c->wheel_discrete_ = false;
++          },
++      .axis_source = [](void*, wl_pointer*, uint32_t) {},
++      .axis_stop = [](void*, wl_pointer*, uint32_t, uint32_t) {},
++      .axis_discrete =
++          [](void* data, wl_pointer*, uint32_t axis, int32_t discrete) {
++            // A mouse wheel's notches, which come before their axis event
++            auto c = static_cast<WaylandConnection*>(data);
++            if (!c->wheel_discrete_)
++              c->wheel_x_ = c->wheel_y_ = 0.0f;
++            c->wheel_discrete_ = true;
++            if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
++              c->wheel_y_ -= discrete;
++            else
++              c->wheel_x_ -= discrete;
++          },
++    };
++
++    static const wl_keyboard_listener keyboard_listener = {
++      .keymap =
++          [](void* data, wl_keyboard*, uint32_t format, int32_t fd, uint32_t size) {
++            auto c = static_cast<WaylandConnection*>(data);
++            if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
++              close(fd);
++              return;
++            }
++            void* map = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
++            close(fd);
++            if (map == MAP_FAILED)
++              return;
++
++            xkb_keymap* keymap = xkb_keymap_new_from_string(c->xkb_context_, static_cast<const char*>(map),
++                                                            XKB_KEYMAP_FORMAT_TEXT_V1,
++                                                            XKB_KEYMAP_COMPILE_NO_FLAGS);
++            munmap(map, size);
++            if (keymap == nullptr)
++              return;
++
++            xkb_state_unref(c->xkb_state_);
++            xkb_keymap_unref(c->xkb_keymap_);
++            c->xkb_keymap_ = keymap;
++            c->xkb_state_ = xkb_state_new(keymap);
++          },
++      .enter =
++          [](void* data, wl_keyboard*, uint32_t, wl_surface* surface, wl_array*) {
++            auto c = static_cast<WaylandConnection*>(data);
++            c->keyboard_focus_ = c->findWindow(surface);
++            if (c->keyboard_focus_)
++              c->keyboard_focus_->handleFocusGained();
++          },
++      .leave =
++          [](void* data, wl_keyboard*, uint32_t, wl_surface*) {
++            auto c = static_cast<WaylandConnection*>(data);
++            if (c->keyboard_focus_)
++              c->keyboard_focus_->handleFocusLost();
++            c->keyboard_focus_ = nullptr;
++            c->repeat_key_ = 0;
++          },
++      .key =
++          [](void* data, wl_keyboard*, uint32_t, uint32_t, uint32_t key, uint32_t state) {
++            auto c = static_cast<WaylandConnection*>(data);
++            if (c->keyboard_focus_ == nullptr || c->xkb_state_ == nullptr)
++              return;
++
++            uint32_t keycode = key + 8;
++            if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
++              c->keyDown(keycode, false);
++              if (xkb_keymap_key_repeats(c->xkb_keymap_, keycode)) {
++                c->repeat_key_ = keycode;
++                c->next_repeat_microseconds_ = time::microseconds() + c->repeat_delay_ * 1000LL;
++              }
++            }
++            else {
++              if (c->repeat_key_ == keycode)
++                c->repeat_key_ = 0;
++              KeyCode key_code = translateKeysym(xkb_state_key_get_one_sym(c->xkb_state_, keycode));
++              if (key_code != KeyCode::Unknown)
++                c->keyboard_focus_->handleKeyUp(key_code, c->modifiers());
++            }
++          },
++      .modifiers =
++          [](void* data, wl_keyboard*, uint32_t, uint32_t depressed, uint32_t latched, uint32_t locked,
++             uint32_t group) {
++            auto c = static_cast<WaylandConnection*>(data);
++            if (c->xkb_state_)
++              xkb_state_update_mask(c->xkb_state_, depressed, latched, locked, 0, 0, group);
++          },
++      .repeat_info =
++          [](void* data, wl_keyboard*, int32_t rate, int32_t delay) {
++            auto c = static_cast<WaylandConnection*>(data);
++            c->repeat_rate_ = rate;
++            c->repeat_delay_ = delay;
++          },
++    };
++
++    if ((capabilities & WL_SEAT_CAPABILITY_POINTER) && pointer_ == nullptr) {
++      pointer_ = wl_seat_get_pointer(seat_);
++      wl_pointer_add_listener(pointer_, &pointer_listener, this);
++    }
++    if ((capabilities & WL_SEAT_CAPABILITY_KEYBOARD) && keyboard_ == nullptr) {
++      keyboard_ = wl_seat_get_keyboard(seat_);
++      wl_keyboard_add_listener(keyboard_, &keyboard_listener, this);
++    }
++  }
++
++  std::unique_ptr<Window> createWaylandEmbeddedWindow(int width, int height, void* display,
++                                                      const std::string& token) {
++    auto window = std::make_unique<WindowWayland>(width, height, static_cast<wl_display*>(display), token);
++    if (!window->isEmbedded())
++      return nullptr;
++    return window;
++  }
++
++  WindowWayland::WindowWayland(int width, int height, wl_display* display, const std::string& token) :
++      Window(width, height), display_(display), logical_width_(width), logical_height_(height) {
++    static const wl_surface_listener surface_listener = {
++      .enter = [](void*, wl_surface*, wl_output*) {},
++      .leave = [](void*, wl_surface*, wl_output*) {},
++      .preferred_buffer_scale =
++          [](void* data, wl_surface*, int32_t factor) {
++            // Until a fractional scale comes, if ever
++            auto window = static_cast<WindowWayland*>(data);
++            if (!window->has_fractional_scale_)
++              window->setScale(factor);
++          },
++      .preferred_buffer_transform = [](void*, wl_surface*, uint32_t) {},
++    };
++    static const wp_fractional_scale_v1_listener fractional_scale_listener = {
++      .preferred_scale =
++          [](void* data, wp_fractional_scale_v1*, uint32_t scale120) {
++            auto window = static_cast<WindowWayland*>(data);
++            window->has_fractional_scale_ = true;
++            window->setScale(scale120 / 120.0);
++          },
++    };
++    static const clap_embedded_surface_v1_listener embedded_listener = {
++      .position = [](void*, clap_embedded_surface_v1*, int32_t, int32_t) {},
++      .closed = [](void* data, clap_embedded_surface_v1*) { static_cast<WindowWayland*>(data)->onClosed(); },
++    };
++
++    connection_ = WaylandConnection::forDisplay(display_);
++    if (connection_->compositor() == nullptr || connection_->embedding() == nullptr) {
++      VISAGE_LOG("The Wayland compositor can't embed: it has no clap_surface_embedding_v1");
++      return;
++    }
++
++    surface_ = wl_compositor_create_surface(connection_->compositor());
++    wl_surface_add_listener(surface_, &surface_listener, this);
++    if (connection_->viewporter()) {
++      viewport_ = wp_viewporter_get_viewport(connection_->viewporter(), surface_);
++      if (connection_->fractionalScaleManager()) {
++        fractional_scale_ = wp_fractional_scale_manager_v1_get_fractional_scale(connection_->fractionalScaleManager(),
++                                                                                surface_);
++        wp_fractional_scale_v1_add_listener(fractional_scale_, &fractional_scale_listener, this);
++      }
++    }
++
++    embedded_surface_ = clap_surface_embedding_v1_get_embedded_surface(connection_->embedding(), surface_,
++                                                                       token.c_str());
++    clap_embedded_surface_v1_add_listener(embedded_surface_, &embedded_listener, this);
++    connection_->addWindow(this);
++
++    // The compositor tells the scale, or closes the embedding right away
++    wl_display_roundtrip(display_);
++    setDpiScale(scale_);
++    handleResized(std::round(logical_width_ * scale_), std::round(logical_height_ * scale_));
++    updateViewport();
++
++    epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
++    timer_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
++    epoll_event event = {};
++    event.events = EPOLLIN;
++    event.data.fd = wl_display_get_fd(display_);
++    epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, event.data.fd, &event);
++    event.data.fd = timer_fd_;
++    epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, timer_fd_, &event);
++
++    start_microseconds_ = time::microseconds();
++  }
++
++  WindowWayland::~WindowWayland() {
++    if (connection_)
++      connection_->removeWindow(this);
++    if (fractional_scale_)
++      wp_fractional_scale_v1_destroy(fractional_scale_);
++    if (viewport_)
++      wp_viewport_destroy(viewport_);
++    if (embedded_surface_)
++      clap_embedded_surface_v1_destroy(embedded_surface_);
++    if (surface_) {
++      // bgfx releases the swap chain on this surface a few frames later
++      wl_surface_attach(surface_, nullptr, 0, 0);
++      wl_surface_commit(surface_);
++      connection_->retireSurface(surface_);
++    }
++    if (display_)
++      wl_display_flush(display_);
++    if (timer_fd_ >= 0)
++      ::close(timer_fd_);
++    if (epoll_fd_ >= 0)
++      ::close(epoll_fd_);
++  }
++
++  void* WindowWayland::initWindow() const {
++    return connection_ ? connection_->modelSurface() : nullptr;
++  }
++
++  void WindowWayland::setScale(double scale) {
++    if (scale <= 0.0 || scale == scale_)
++      return;
++
++    scale_ = scale;
++    // During construction, the constructor applies it
++    if (epoll_fd_ < 0)
++      return;
++
++    setDpiScale(scale_);
++    updateViewport();
++    handleResized(std::round(logical_width_ * scale_), std::round(logical_height_ * scale_));
++  }
++
++  // The swap chain's buffers have the native size: the compositor scales them to the logical one
++  void WindowWayland::updateViewport() {
++    if (viewport_)
++      wp_viewport_set_destination(viewport_, logical_width_, logical_height_);
++    else
++      wl_surface_set_buffer_scale(surface_, std::max(1, static_cast<int>(std::round(scale_))));
++  }
++
++  void WindowWayland::windowContentsResized(int width, int height) {
++    if (surface_ == nullptr)
++      return;
++    logical_width_ = std::round(width / scale_);
++    logical_height_ = std::round(height / scale_);
++    updateViewport();
++  }
++
++  void WindowWayland::onClosed() {
++    VISAGE_LOG("The host ended the embedding");
++    hide();
++    clap_embedded_surface_v1_destroy(embedded_surface_);
++    embedded_surface_ = nullptr;
++  }
++
++  void WindowWayland::tick() {
++    connection_->tick();
++    if (showing_ && isVisible())
++      drawCallback((time::microseconds() - start_microseconds_) / 1000000.0);
++  }
++
++  void WindowWayland::processPluginFdEvents() {
++    if (connection_ == nullptr)
++      return;
++
++    connection_->dispatch();
++    uint64_t expirations = 0;
++    if (read(timer_fd_, &expirations, sizeof(expirations)) == sizeof(expirations))
++      tick();
++  }
++
++  void WindowWayland::runEventLoop() {
++    while (showing_) {
++      pollfd fd = { epoll_fd_, POLLIN, 0 };
++      poll(&fd, 1, -1);
++      processPluginFdEvents();
++    }
++  }
++
++  void WindowWayland::show() {
++    if (showing_ || embedded_surface_ == nullptr)
++      return;
++
++    showing_ = true;
++    setVisible(true);
++    itimerspec spec = {};
++    spec.it_interval.tv_nsec = kTimerMs * 1000000L;
++    spec.it_value.tv_nsec = kTimerMs * 1000000L;
++    timerfd_settime(timer_fd_, 0, &spec, nullptr);
++    handleWindowShown();
++  }
++
++  void WindowWayland::hide() {
++    if (!showing_)
++      return;
++
++    showing_ = false;
++    setVisible(false);
++    itimerspec spec = {};
++    timerfd_settime(timer_fd_, 0, &spec, nullptr);
++    // Unmapped until the next frame
++    wl_surface_attach(surface_, nullptr, 0, 0);
++    wl_surface_commit(surface_);
++    wl_display_flush(display_);
++    handleWindowHidden();
++  }
++}
++
++#endif
+diff --git a/visage_windowing/linux/windowing_wayland.h b/visage_windowing/linux/windowing_wayland.h
+new file mode 100644
+index 0000000..6ed1fd2
+--- /dev/null
++++ b/visage_windowing/linux/windowing_wayland.h
+@@ -0,0 +1,101 @@
++/* Copyright Vital Audio, LLC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ */
++
++#pragma once
++
++// A plugin window embedded into a host application's window on Wayland, through the host's
++// nested compositor and the clap_surface_embedding_v1 protocol (see
++// https://github.com/free-audio/clap-wayland-experiment).
++//
++// The caller connects to the host's compositor and gives us the wl_display, which several windows
++// may share. bgfx is global to the process and draws on one wl_display only, so all the windows of
++// the process must use the same one.
++
++#if VISAGE_LINUX && VISAGE_WAYLAND
++#include "windowing.h"
++
++#include <string>
++
++struct clap_embedded_surface_v1;
++struct wl_callback;
++struct wl_display;
++struct wl_surface;
++struct wp_fractional_scale_v1;
++struct wp_viewport;
++
++namespace visage {
++  class WaylandConnection;
++
++  class WindowWayland : public Window {
++  public:
++    static constexpr int kTimerMs = 16;
++
++    // width and height are in logical pixels, as the host gave them
++    WindowWayland(int width, int height, wl_display* display, const std::string& token);
++    ~WindowWayland() override;
++
++    bool isEmbedded() const { return embedded_surface_ != nullptr; }
++
++    void runEventLoop() override;
++    void* nativeHandle() const override { return surface_; }
++    void windowContentsResized(int width, int height) override;
++
++    void* initWindow() const override;
++    void* globalDisplay() const override { return display_; }
++    bool usesWayland() const override { return true; }
++    void processPluginFdEvents() override;
++    int posixFd() const override { return epoll_fd_; }
++
++    void show() override;
++    void showMaximized() override { show(); }
++    void hide() override;
++    void close() override { hide(); }
++    bool isShowing() const override { return showing_; }
++    void setWindowTitle(const std::string& title) override { }
++    IPoint maxWindowDimensions() const override { return { 16384, 16384 }; }
++
++  private:
++    friend class WaylandConnection;
++
++    void setScale(double scale);
++    void updateViewport();
++    void onClosed();
++    void tick();
++
++    WaylandConnection* connection_ = nullptr;
++    wl_display* display_ = nullptr;
++    wl_surface* surface_ = nullptr;
++    clap_embedded_surface_v1* embedded_surface_ = nullptr;
++    wp_viewport* viewport_ = nullptr;
++    wp_fractional_scale_v1* fractional_scale_ = nullptr;
++
++    int epoll_fd_ = -1;
++    int timer_fd_ = -1;
++    bool showing_ = false;
++    double scale_ = 1.0;
++    bool has_fractional_scale_ = false; // which then wins over the integer one
++    int logical_width_ = 0;
++    int logical_height_ = 0;
++    long long start_microseconds_ = 0;
++  };
++}
++
++#endif
+diff --git a/visage_windowing/linux/windowing_x11.cpp b/visage_windowing/linux/windowing_x11.cpp
+index a0fbf2d..07298aa 100644
+--- a/visage_windowing/linux/windowing_x11.cpp
++++ b/visage_windowing/linux/windowing_x11.cpp
+@@ -910,6 +910,11 @@ namespace visage {
+     }
+   }
+ 
++  // For the Wayland windows too: XKB's keysyms are X11's
++  KeyCode translateKeysym(unsigned int keysym) {
++    return translateKeyCode(keysym);
++  }
++
+   ::Window WindowX11::windowUnderCursor(::Window inside) {
+     ::Window root_return, child_return;
+     int root_x, root_y, win_x, win_y;
+diff --git a/visage_windowing/windowing.h b/visage_windowing/windowing.h
+index 0405781..4a4388a 100644
+--- a/visage_windowing/windowing.h
++++ b/visage_windowing/windowing.h
+@@ -101,6 +101,8 @@ namespace visage {
+ 
+     virtual void* initWindow() const { return nullptr; }
+     virtual void* globalDisplay() const { return nullptr; }
++    // Linux: the native handles are a wl_surface and a wl_display instead of X11's
++    virtual bool usesWayland() const { return false; }
+     virtual void processPluginFdEvents() { }
+     virtual int posixFd() const { return 0; }
+ 
+@@ -231,6 +233,16 @@ namespace visage {
+   std::unique_ptr<Window> createPluginWindow(const Dimension& width, const Dimension& height,
+                                              void* parent_handle);
+ 
++  // Linux, built with VISAGE_WAYLAND: a plugin window embedded into the host's window through the
++  // host's nested Wayland compositor (clap_surface_embedding_v1, see clap-wayland-experiment).
++  // display is a wl_display connected to that compositor, which the caller owns: it must outlive
++  // every window on it and the renderer, so a plugin keeps it until it is unloaded. All the
++  // windows of the process must share one display, since the renderer is global. token is the
++  // embedding token from the host. width and height are in logical pixels. Returns nullptr if the
++  // compositor can't embed.
++  std::unique_ptr<Window> createWaylandEmbeddedWindow(int width, int height, void* display,
++                                                      const std::string& token);
++
+   inline std::unique_ptr<Window> createWindow(const Dimension& width, const Dimension& height,
+                                               Window::Decoration decoration_style = Window::Decoration::Native) {
+     return createWindow({}, {}, width, height, decoration_style);

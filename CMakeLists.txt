@@ -36,6 +36,12 @@ else()
   message(STATUS "SDL3 not found (libsdl3-dev), plugins/sdl3-demo is not built")
 endif()
 
+# Visage, only on request: -DBUILD_VISAGE_DEMO=ON
+include(Visage)
+
+# Pugl, only on request: -DBUILD_PUGL_DEMO=ON
+include(Pugl)
+
 # free-audio/clap-plugins, whose ImGui plugins (synth, check-wayland-embed, ...) were the first to
 # implement the embedding. They take a while to build, so only on request:
 #
