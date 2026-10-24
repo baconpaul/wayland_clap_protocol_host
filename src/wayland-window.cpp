@@ -93,7 +93,8 @@ WaylandConnection::~WaylandConnection() {
       wl_display_disconnect(_display);
 }
 
-bool WaylandConnection::open() {
+bool WaylandConnection::open(const char *appId) {
+   _appId = appId;
    _display = wl_display_connect(nullptr);
    if (!_display) {
       std::cerr << "failed to connect to the Wayland compositor (is WAYLAND_DISPLAY set?)\n";
@@ -164,7 +165,7 @@ bool WaylandWindow::open(const char *title, uint32_t width, uint32_t height) {
    _surface = wl_compositor_create_surface(_connection._compositor);
    _frame = libdecor_decorate(_connection._decor, _surface, &frameInterface, this);
    libdecor_frame_set_title(_frame, title);
-   libdecor_frame_set_app_id(_frame, "clap-wayland-host");
+   libdecor_frame_set_app_id(_frame, _connection._appId);
    // The plugin decides the size, see resize(); maximizing would only add empty space
    libdecor_frame_unset_capabilities(
       _frame, static_cast<libdecor_capabilities>(LIBDECOR_ACTION_RESIZE | LIBDECOR_ACTION_FULLSCREEN));

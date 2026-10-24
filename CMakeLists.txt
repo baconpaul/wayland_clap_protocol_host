@@ -36,6 +36,13 @@ else()
   message(STATUS "SDL3 not found (libsdl3-dev), plugins/sdl3-demo is not built")
 endif()
 
+# The same embedding for VST3: an interface, a host and a plugin. Fetches the VST 3 SDK, or
+# -DVST3_SDK_DIR=<a checkout>
+option(BUILD_VST3_EQUIV "Build vst3_equiv: the VST3 host and plugin" ON)
+if(BUILD_VST3_EQUIV)
+  add_subdirectory(vst3_equiv)
+endif()
+
 # Visage, only on request: -DBUILD_VISAGE_DEMO=ON
 include(Visage)
 

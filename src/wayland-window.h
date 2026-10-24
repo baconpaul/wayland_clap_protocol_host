@@ -34,7 +34,8 @@ public:
    WaylandConnection(const WaylandConnection &) = delete;
    WaylandConnection &operator=(const WaylandConnection &) = delete;
 
-   [[nodiscard]] bool open();
+   // appId is the windows' xdg_toplevel app id
+   [[nodiscard]] bool open(const char *appId = "clap-wayland-host");
 
    // What the nested compositor needs to forward the plugins' surfaces
    NestedCompositor::Upstream upstream() const;
@@ -55,6 +56,7 @@ private:
    bool isOurs(wl_surface *surface) const;
 
    bool _isConnected = false;
+   const char *_appId = nullptr;
 
    wl_display *_display = nullptr;
    wl_registry *_registry = nullptr;

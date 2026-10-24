@@ -22,6 +22,10 @@ It implements the "nested compositor" approach from
 It comes with two small example plugins of its own, and a target which builds the ImGui examples
 from [free-audio/clap-plugins](https://github.com/free-audio/clap-plugins).
 
+[`vst3_equiv/`](vst3_equiv/README.md) does the same for VST3, as an alternative to VST 3.8's
+`wl_surface`-based Wayland support: an interface, a VST3 host on the same nested compositor, and a
+plugin.
+
 ## Building on Ubuntu 26.04
 
 ```bash
@@ -49,7 +53,8 @@ cmake --build build
 cmake --build build --target example-plugins
 ```
 
-The submodules are `libs/clap` and `libs/clap-wayland-experiment`. If you cloned without
+The build fetches the VST 3 SDK for [`vst3_equiv/`](vst3_equiv/README.md); `-DBUILD_VST3_EQUIV=OFF`
+skips it. The submodules are `libs/clap` and `libs/clap-wayland-experiment`. If you cloned without
 `--recursive`, run `git submodule update --init`.
 
 [`.github/workflows/build.yml`](.github/workflows/build.yml) builds all of it on Ubuntu 26.04
@@ -207,7 +212,13 @@ And how it behaves:
 | `cmake/Visage.cmake`, `cmake/Pugl.cmake` | the optional `visage-demo` and `pugl-demo`: fetch, patch, build |
 | `patches/` | the patches to Visage and Pugl which those two demos need |
 | `plugins/` | the example plugins |
+| `vst3_equiv/` | the VST3 equivalent: interface, host and plugin, see [its README](vst3_equiv/README.md) |
+| `cmake/Vst3Sdk.cmake` | the VST 3 SDK for `vst3_equiv`, fetched, as three static libraries |
 | `libs/` | `clap` and `clap-wayland-experiment`, as submodules |
+
+`src/wayland-window.*`, `src/nested-compositor.*` and `src/decorations.*` know nothing of the
+plugin format: they are the `wayland-embedding-host` library, which the CLAP host and the VST3 host
+share.
 
 ## How the embedding works
 
